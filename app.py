@@ -1,6 +1,7 @@
 import streamlit as st
 import folium
 import pandas as pd
+import re
 import warnings
 from pathlib import Path
 from streamlit_folium import st_folium
@@ -50,6 +51,12 @@ RISK_BY_RAINFALL = {
     },
 }
 
+EXPECTED_STAGE_BY_RAINFALL = {
+    "10mm/h": 2,
+    "30mm/h": 4,
+    "50mm/h": 6,
+}
+
 RAIN_DROPS = "".join(
     f'<span style="left:{left}%; animation-delay:{delay}s; animation-duration:{duration}s;"></span>'
     for left, delay, duration in [
@@ -73,6 +80,13 @@ def find_shp_files(folder):
     if not folder.exists():
         return []
     return sorted(folder.rglob("*.shp"))
+
+
+def get_expected_stage(shp_path):
+    match = re.search(r"DS_FLOODING_(\d+)", shp_path.stem, re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def has_required_sidecars(shp_path):
@@ -153,6 +167,17 @@ def combine_shp_files(shp_files):
     return combined, len(combined), messages
 
 
+def combine_gdfs(gdfs):
+    valid = [gdf for gdf in gdfs if gdf is not None and not gdf.empty]
+    if not valid:
+        return None
+
+    return gpd.GeoDataFrame(
+        geometry=pd.concat([item.geometry for item in valid], ignore_index=True),
+        crs="EPSG:4326",
+    )
+
+
 def simplify_for_map(gdf):
     if gdf is None or gdf.empty:
         return None
@@ -174,7 +199,7 @@ def build_data_signature():
 def load_spatial_layers(signature):
     if gpd is None:
         return {
-            "expected": None,
+            "expected_by_stage": {},
             "history_2022": None,
             "history_2023": None,
             "summary": [
@@ -190,7 +215,23 @@ def load_spatial_layers(signature):
     history_2022_files = [path for path in history_files if "2022" in path.name]
     history_2023_files = [path for path in history_files if "2023" in path.name]
 
-    expected, expected_count, expected_messages = combine_shp_files(expected_files)
+    expected_by_stage = {}
+    expected_stage_counts = {}
+    expected_messages = []
+    for expected_file in expected_files:
+        stage = get_expected_stage(expected_file)
+        gdf, message = read_shp_file(expected_file)
+        if message:
+            expected_messages.append(message)
+        if gdf is None:
+            continue
+        if stage is None:
+            stage = len(expected_by_stage) + 1
+            expected_messages.append(f"{expected_file.name}: 단계 번호를 파일명에서 찾지 못해 {stage}단계로 표시")
+        expected_stage_counts[stage] = len(gdf)
+        expected_by_stage[stage] = simplify_for_map(gdf)
+
+    expected_count = sum(expected_stage_counts.values())
     history_2022, history_2022_count, history_2022_messages = combine_shp_files(history_2022_files)
     history_2023, history_2023_count, history_2023_messages = combine_shp_files(history_2023_files)
 
@@ -207,7 +248,8 @@ def load_spatial_layers(signature):
     messages.extend(history_2023_messages)
 
     return {
-        "expected": simplify_for_map(expected),
+        "expected_by_stage": expected_by_stage,
+        "expected_stage_counts": expected_stage_counts,
         "history_2022": simplify_for_map(history_2022),
         "history_2023": simplify_for_map(history_2023),
         "summary": [
@@ -219,7 +261,7 @@ def load_spatial_layers(signature):
     }
 
 
-def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weight, show):
+def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weight, show, dash_array=None):
     if gdf is None or gdf.empty:
         return
 
@@ -231,13 +273,14 @@ def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weigh
             "weight": weight,
             "fillColor": fill_color,
             "fillOpacity": fill_opacity,
+            "dashArray": dash_array,
         },
-        smooth_factor=0.6,
+        smooth_factor=0.8,
         show=show,
     ).add_to(map_obj)
 
 
-def render_data_status_card(summary, messages):
+def render_data_status_card(summary, messages, expected_stage_label, expected_feature_count):
     rows = "".join(
         f"""
         <div class="data-row">
@@ -255,6 +298,11 @@ def render_data_status_card(summary, messages):
         f"""
 <div class="sidebar-card">
     <div class="sidebar-card-title">불러온 공간 데이터</div>
+    <div class="scenario-row">
+        <span>현재 표시 예상도</span>
+        <b>{expected_stage_label}</b>
+        <small>{expected_feature_count:,}개 polygon</small>
+    </div>
     {rows}
     <div class="sidebar-card-note">{notes_html}</div>
 </div>
@@ -333,6 +381,32 @@ st.markdown(
 
     .data-row:first-of-type {
         border-top: 0;
+    }
+
+    .scenario-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 4px 8px;
+        padding: 10px 0 12px;
+        margin-bottom: 4px;
+        border-bottom: 1px solid #dbeafe;
+    }
+
+    .scenario-row span {
+        font-size: 13px;
+        font-weight: 900;
+        color: #0369a1 !important;
+    }
+
+    .scenario-row b {
+        font-size: 13px;
+        color: #0f766e;
+    }
+
+    .scenario-row small {
+        grid-column: 1 / -1;
+        color: #64748b;
+        font-size: 12px;
     }
 
     .data-row span {
@@ -615,17 +689,38 @@ risk = RISK_BY_RAINFALL[rainfall]
 with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
     spatial_layers = load_spatial_layers(build_data_signature())
 
+max_expected_stage = EXPECTED_STAGE_BY_RAINFALL[rainfall]
+visible_expected_stages = [
+    stage
+    for stage in sorted(spatial_layers["expected_by_stage"])
+    if stage <= max_expected_stage
+]
+visible_expected_layer = combine_gdfs(
+    [spatial_layers["expected_by_stage"][stage] for stage in visible_expected_stages]
+)
+visible_expected_count = sum(
+    spatial_layers["expected_stage_counts"].get(stage, 0)
+    for stage in visible_expected_stages
+)
+expected_stage_label = f"1~{max_expected_stage}단계"
+
 st.sidebar.markdown(
     f"""
 <div style="margin-top:22px; color:#334155; font-size:15px; line-height:1.7;">
     선택한 강수량: <b>{rainfall}</b><br>
+    표시 예상도: <b>{expected_stage_label}</b><br>
     위험도: <b style="color:{risk['color']}">{risk['level']}</b>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-render_data_status_card(spatial_layers["summary"], spatial_layers["messages"])
+render_data_status_card(
+    spatial_layers["summary"],
+    spatial_layers["messages"],
+    expected_stage_label,
+    visible_expected_count,
+)
 
 
 st.markdown(
@@ -652,9 +747,9 @@ st.markdown(
         <div class="metric-note">SHP 데이터 기반 시각화</div>
     </div>
     <div class="metric-card">
-        <div class="metric-label">지도 레이어</div>
-        <div class="metric-value">3종</div>
-        <div class="metric-note">예상도 · 2022 · 2023</div>
+        <div class="metric-label">침수예상도 단계</div>
+        <div class="metric-value">{expected_stage_label}</div>
+        <div class="metric-note">강수량 시나리오 적용</div>
     </div>
     <div class="metric-card">
         <div class="metric-label">강수량 시나리오</div>
@@ -682,12 +777,12 @@ m = folium.Map(
 
 add_polygon_layer(
     m,
-    spatial_layers["expected"],
-    "침수예상도",
-    color="#0ea5e9",
+    visible_expected_layer,
+    f"침수예상도 {expected_stage_label}",
+    color="#0284c7",
     fill_color="#38bdf8",
-    fill_opacity=0.22,
-    weight=1,
+    fill_opacity=0.14,
+    weight=0.9,
     show=True,
 )
 
@@ -695,11 +790,11 @@ add_polygon_layer(
     m,
     spatial_layers["history_2022"],
     "2022 침수흔적도",
-    color="#f59e0b",
+    color="#d97706",
     fill_color="#facc15",
-    fill_opacity=0.34,
-    weight=1,
-    show=True,
+    fill_opacity=0.08,
+    weight=1.15,
+    show=False,
 )
 
 add_polygon_layer(
@@ -708,9 +803,10 @@ add_polygon_layer(
     "2023 침수흔적도",
     color="#ef4444",
     fill_color="#fb7185",
-    fill_opacity=0.28,
-    weight=1,
+    fill_opacity=0.12,
+    weight=1.2,
     show=False,
+    dash_array="4",
 )
 
 folium.Marker(
@@ -737,8 +833,8 @@ legend_html = f"""
     box-shadow: 0 8px 22px rgba(15,23,42,0.14);
 ">
     <div style="font-weight: 900; margin-bottom: 6px;">SHP 지도 레이어</div>
-    <div><span style="display:inline-block;width:10px;height:10px;background:#38bdf8;border:1px solid #0ea5e9;margin-right:6px;"></span>침수예상도</div>
-    <div><span style="display:inline-block;width:10px;height:10px;background:#facc15;border:1px solid #f59e0b;margin-right:6px;"></span>2022 침수흔적도</div>
+    <div><span style="display:inline-block;width:10px;height:10px;background:#38bdf8;border:1px solid #0284c7;margin-right:6px;"></span>침수예상도 {expected_stage_label}</div>
+    <div><span style="display:inline-block;width:10px;height:10px;background:#facc15;border:1px solid #d97706;margin-right:6px;"></span>2022 침수흔적도</div>
     <div><span style="display:inline-block;width:10px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
 </div>
 """
@@ -749,10 +845,10 @@ st.markdown(
 <div class="map-card">
     <div class="section-head">
         <h3>침수예상도 / 침수흔적도 지도</h3>
-        <span>{rainfall} · {mode}</span>
+        <span>{rainfall} · {expected_stage_label} · {mode}</span>
     </div>
     <div class="source-note">
-        데이터: <b>data/flood_expected</b>, <b>data/flood_history</b> 폴더의 압축 해제된 SHP 파일
+        데이터: <b>data/flood_expected</b>, <b>data/flood_history</b> 폴더의 압축 해제된 SHP 파일 · 2022/2023 침수흔적도는 우측 레이어 버튼에서 켤 수 있습니다.
     </div>
 """,
     unsafe_allow_html=True,
