@@ -58,12 +58,12 @@ EXPECTED_STAGE_BY_RAINFALL = {
 }
 
 EXPECTED_STAGE_STYLE = {
-    1: {"color": "#0ea5e9", "fill": "#bae6fd", "opacity": 0.16},
-    2: {"color": "#06b6d4", "fill": "#67e8f9", "opacity": 0.16},
-    3: {"color": "#14b8a6", "fill": "#5eead4", "opacity": 0.15},
-    4: {"color": "#84cc16", "fill": "#bef264", "opacity": 0.15},
-    5: {"color": "#f59e0b", "fill": "#fbbf24", "opacity": 0.17},
-    6: {"color": "#ef4444", "fill": "#fb7185", "opacity": 0.18},
+    1: {"label": "~0.5m", "color": "#d7cf2f", "fill": "#fff86a", "opacity": 0.46},
+    2: {"label": "0.5~1.0m", "color": "#a9d94a", "fill": "#ccff66", "opacity": 0.43},
+    3: {"label": "1.0~1.5m", "color": "#25c189", "fill": "#66f0bd", "opacity": 0.42},
+    4: {"label": "1.5~2.0m", "color": "#359fa1", "fill": "#73c9c8", "opacity": 0.42},
+    5: {"label": "2.0~3.0m", "color": "#398fca", "fill": "#72c9ff", "opacity": 0.42},
+    6: {"label": "3.0m~", "color": "#7e22ce", "fill": "#a855f7", "opacity": 0.44},
 }
 
 RAIN_DROPS = "".join(
@@ -791,19 +791,28 @@ analysis_center = [37.5172, 127.0473]
 m = folium.Map(
     location=analysis_center,
     zoom_start=13,
-    tiles="OpenStreetMap",
+    tiles="CartoDB positron",
 )
+
+tile_filter_css = """
+<style>
+    .leaflet-tile-pane img {
+        filter: saturate(0.52) contrast(0.92) brightness(1.06);
+    }
+</style>
+"""
+m.get_root().header.add_child(folium.Element(tile_filter_css))
 
 for stage in visible_expected_stages:
     style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
     add_polygon_layer(
         m,
         spatial_layers["expected_by_stage"].get(stage),
-        f"침수예상도 {stage}단계",
+        f"침수예상도 {style['label']}",
         color=style["color"],
         fill_color=style["fill"],
         fill_opacity=style["opacity"],
-        weight=1.0,
+        weight=0.9,
         show=show_expected,
     )
 
@@ -839,6 +848,17 @@ folium.Marker(
 
 folium.LayerControl(collapsed=True).add_to(m)
 
+expected_legend_rows = "".join(
+    f"""
+    <div style="display:flex; align-items:center; gap:7px; margin-top:4px;">
+        <span style="display:inline-block;width:18px;height:10px;background:{style['fill']};border:1px solid {style['color']};"></span>
+        <span>{style['label']}</span>
+    </div>
+"""
+    for stage, style in EXPECTED_STAGE_STYLE.items()
+    if stage <= max_expected_stage
+)
+
 legend_html = f"""
 <div style="
     position: fixed;
@@ -853,10 +873,11 @@ legend_html = f"""
     font-size: 12px;
     box-shadow: 0 8px 22px rgba(15,23,42,0.14);
 ">
-    <div style="font-weight: 900; margin-bottom: 6px;">SHP 지도 레이어</div>
-    <div><span style="display:inline-block;width:10px;height:10px;background:#38bdf8;border:1px solid #0284c7;margin-right:6px;"></span>침수예상도 {expected_stage_label}</div>
-    <div><span style="display:inline-block;width:10px;height:10px;background:#facc15;border:1px solid #d97706;margin-right:6px;"></span>2022 침수흔적도</div>
-    <div><span style="display:inline-block;width:10px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
+    <div style="font-weight: 900; margin-bottom: 6px;">침수예상도 단계</div>
+    {expected_legend_rows}
+    <div style="height:1px;background:#e2e8f0;margin:9px 0 7px;"></div>
+    <div><span style="display:inline-block;width:18px;height:10px;background:#facc15;border:1px solid #d97706;margin-right:6px;"></span>2022 침수흔적도</div>
+    <div><span style="display:inline-block;width:18px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
 </div>
 """
 m.get_root().html.add_child(folium.Element(legend_html))
