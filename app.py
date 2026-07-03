@@ -57,6 +57,15 @@ EXPECTED_STAGE_BY_RAINFALL = {
     "50mm/h": 6,
 }
 
+EXPECTED_STAGE_STYLE = {
+    1: {"color": "#0ea5e9", "fill": "#bae6fd", "opacity": 0.16},
+    2: {"color": "#06b6d4", "fill": "#67e8f9", "opacity": 0.16},
+    3: {"color": "#14b8a6", "fill": "#5eead4", "opacity": 0.15},
+    4: {"color": "#84cc16", "fill": "#bef264", "opacity": 0.15},
+    5: {"color": "#f59e0b", "fill": "#fbbf24", "opacity": 0.17},
+    6: {"color": "#ef4444", "fill": "#fb7185", "opacity": 0.18},
+}
+
 RAIN_DROPS = "".join(
     f'<span style="left:{left}%; animation-delay:{delay}s; animation-duration:{duration}s;"></span>'
     for left, delay, duration in [
@@ -684,6 +693,19 @@ mode = st.sidebar.radio(
     ["최단경로", "안전경로"],
 )
 
+st.sidebar.markdown(
+    """
+<div style="margin-top:18px; margin-bottom:6px; color:#172033; font-size:14px; font-weight:900;">
+    지도 레이어 표시
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+show_expected = st.sidebar.checkbox("침수예상도 표시", value=True)
+show_history_2022 = st.sidebar.checkbox("2022 침수흔적도 표시", value=True)
+show_history_2023 = st.sidebar.checkbox("2023 침수흔적도 표시", value=False)
+
 risk = RISK_BY_RAINFALL[rainfall]
 
 with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
@@ -695,9 +717,6 @@ visible_expected_stages = [
     for stage in sorted(spatial_layers["expected_by_stage"])
     if stage <= max_expected_stage
 ]
-visible_expected_layer = combine_gdfs(
-    [spatial_layers["expected_by_stage"][stage] for stage in visible_expected_stages]
-)
 visible_expected_count = sum(
     spatial_layers["expected_stage_counts"].get(stage, 0)
     for stage in visible_expected_stages
@@ -775,16 +794,18 @@ m = folium.Map(
     tiles="OpenStreetMap",
 )
 
-add_polygon_layer(
-    m,
-    visible_expected_layer,
-    f"침수예상도 {expected_stage_label}",
-    color="#0284c7",
-    fill_color="#38bdf8",
-    fill_opacity=0.14,
-    weight=0.9,
-    show=True,
-)
+for stage in visible_expected_stages:
+    style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
+    add_polygon_layer(
+        m,
+        spatial_layers["expected_by_stage"].get(stage),
+        f"침수예상도 {stage}단계",
+        color=style["color"],
+        fill_color=style["fill"],
+        fill_opacity=style["opacity"],
+        weight=1.0,
+        show=show_expected,
+    )
 
 add_polygon_layer(
     m,
@@ -792,9 +813,9 @@ add_polygon_layer(
     "2022 침수흔적도",
     color="#d97706",
     fill_color="#facc15",
-    fill_opacity=0.08,
-    weight=1.15,
-    show=False,
+    fill_opacity=0.18,
+    weight=1.6,
+    show=show_history_2022,
 )
 
 add_polygon_layer(
@@ -803,9 +824,9 @@ add_polygon_layer(
     "2023 침수흔적도",
     color="#ef4444",
     fill_color="#fb7185",
-    fill_opacity=0.12,
-    weight=1.2,
-    show=False,
+    fill_opacity=0.2,
+    weight=1.8,
+    show=show_history_2023,
     dash_array="4",
 )
 
@@ -854,6 +875,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st_folium(m, width=1240, height=620)
+map_key = (
+    f"rainguard_map_{rainfall}_{show_expected}_"
+    f"{show_history_2022}_{show_history_2023}_{expected_stage_label}"
+)
+st_folium(m, width=1240, height=620, key=map_key)
 
 st.markdown("</div>", unsafe_allow_html=True)
