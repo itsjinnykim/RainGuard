@@ -2,7 +2,7 @@
 
 공공데이터 기반 도시 침수 위험 예측 및 안전 이동 경로 추천 서비스 MVP입니다.
 
-현재 버전은 제안서 제출 전 구현 가능성을 보여주기 위한 Streamlit 프로토타입입니다. 지도에는 서울안전누리 안전정보지도 > 태풍·호우 > 침수흔적도 공식 WMS 레이어를 표시합니다.
+현재 버전은 제안서 제출 전 구현 가능성을 보여주기 위한 Streamlit 프로토타입입니다. 지도에는 `data/flood_expected`, `data/flood_history` 폴더의 압축 해제된 SHP 파일을 표시합니다.
 
 ## 실행 방법
 
@@ -14,15 +14,11 @@ streamlit run app.py
 ## 현재 구현
 
 - 강수량 시나리오 선택: `10mm/h`, `30mm/h`, `50mm/h`
-- 서울안전누리 침수흔적도 연도 선택
+- 침수예상도, 2022 침수흔적도, 2023 침수흔적도 SHP 자동 로딩
 - 시나리오별 침수 위험도 카드 표시
 - Folium 기반 지도 시각화
-- 공식 침수흔적도 WMS 이미지 오버레이 표시
-
-## 확정 데이터 출처
-
-- 서울안전누리 침수흔적도: https://safecity.seoul.go.kr/distFclt/cfMapDs/cfMapDs.page?menuId=MENU_SSNS_000014
-- 기상청 단기예보 조회서비스: https://www.data.go.kr/data/15084084/openapi.do
+- 지도 LayerControl로 각 polygon 레이어 켜기/끄기
+- 왼쪽 패널에 불러온 SHP 데이터 개수 표시
 
 ## 다음 고도화
 

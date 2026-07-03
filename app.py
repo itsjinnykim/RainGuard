@@ -1,7 +1,20 @@
 import streamlit as st
 import folium
-from urllib.parse import quote
+import pandas as pd
+import warnings
+from pathlib import Path
 from streamlit_folium import st_folium
+
+warnings.filterwarnings(
+    "ignore",
+    message="One or several characters couldn't be converted.*",
+    category=RuntimeWarning,
+)
+
+try:
+    import geopandas as gpd
+except ImportError:
+    gpd = None
 
 
 st.set_page_config(
@@ -10,6 +23,11 @@ st.set_page_config(
     layout="wide",
 )
 
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+FLOOD_EXPECTED_DIR = DATA_DIR / "flood_expected"
+FLOOD_HISTORY_DIR = DATA_DIR / "flood_history"
 
 RISK_BY_RAINFALL = {
     "10mm/h": {
@@ -32,31 +50,6 @@ RISK_BY_RAINFALL = {
     },
 }
 
-FLOOD_TRACE_YEARS = [
-    "2025",
-    "2024",
-    "2023",
-    "2022",
-    "2020",
-    "2019",
-    "2018",
-    "2017",
-    "2016",
-    "2014",
-    "2013",
-    "2012",
-    "2011",
-    "2010",
-]
-
-SAFECITY_MAP_URL = "https://safecity.seoul.go.kr/distFclt/cfMapDs/cfMapDs.page?menuId=MENU_SSNS_000014"
-SAFECITY_WMS_URL = "https://safecity.seoul.go.kr/G2DataService/GService"
-FLOOD_TRACE_BBOX_5186 = "196903.25,539510.30,211944.60,551726.89"
-FLOOD_TRACE_BOUNDS_WGS84 = [
-    [37.455, 126.965],
-    [37.565, 127.135],
-]
-
 RAIN_DROPS = "".join(
     f'<span style="left:{left}%; animation-delay:{delay}s; animation-duration:{duration}s;"></span>'
     for left, delay, duration in [
@@ -76,12 +69,197 @@ RAIN_DROPS = "".join(
 )
 
 
-def build_flood_trace_wms_url(year):
-    layer_name = quote(f"수방 침수흔적도 {year}", safe="")
-    return (
-        f"{SAFECITY_WMS_URL}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
-        f"&FORMAT=image/png&TRANSPARENT=TRUE&LAYERS={layer_name}"
-        f"&CRS=EPSG:5186&BBOX={FLOOD_TRACE_BBOX_5186}&WIDTH=1100&HEIGHT=800"
+def find_shp_files(folder):
+    if not folder.exists():
+        return []
+    return sorted(folder.rglob("*.shp"))
+
+
+def has_required_sidecars(shp_path):
+    required = [".shx", ".dbf"]
+    return [ext for ext in required if not shp_path.with_suffix(ext).exists()]
+
+
+def infer_missing_crs(gdf):
+    if gdf.empty:
+        return "EPSG:4326"
+
+    minx, miny, maxx, maxy = gdf.total_bounds
+    if 120 <= minx <= 140 and 30 <= miny <= 45:
+        return "EPSG:4326"
+    if 100000 <= minx <= 300000 and 400000 <= miny <= 700000:
+        return "EPSG:5186"
+    if 800000 <= minx <= 1100000 and 1800000 <= miny <= 2100000:
+        return "EPSG:5179"
+    return "EPSG:5186"
+
+
+def read_shp_file(shp_path):
+    missing = has_required_sidecars(shp_path)
+    if missing:
+        return None, f"{shp_path.name}: {', '.join(missing)} 파일이 없어 건너뜀"
+
+    read_error = None
+    for options in ({}, {"encoding": "utf-8"}, {"encoding": "cp949"}, {"encoding": "euc-kr"}):
+        try:
+            gdf = gpd.read_file(shp_path, **options)
+            break
+        except Exception as exc:
+            read_error = exc
+    else:
+        return None, f"{shp_path.name}: 읽기 실패 ({read_error})"
+
+    if "geometry" not in gdf.columns:
+        return None, f"{shp_path.name}: geometry 컬럼이 없어 건너뜀"
+
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[~gdf.geometry.is_empty].copy()
+    if gdf.empty:
+        return None, f"{shp_path.name}: 표시할 geometry가 없음"
+
+    notes = []
+    if gdf.crs is None:
+        inferred_crs = infer_missing_crs(gdf)
+        gdf = gdf.set_crs(inferred_crs, allow_override=True)
+        notes.append(f"CRS 없음, {inferred_crs}로 가정")
+
+    if gdf.crs and gdf.crs.to_epsg() != 4326:
+        gdf = gdf.to_crs(epsg=4326)
+
+    gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
+    if gdf.empty:
+        return None, f"{shp_path.name}: Polygon/MultiPolygon 데이터가 없음"
+
+    return gdf[["geometry"]].copy(), "; ".join(notes)
+
+
+def combine_shp_files(shp_files):
+    loaded = []
+    messages = []
+    for shp_path in shp_files:
+        gdf, message = read_shp_file(shp_path)
+        if message:
+            messages.append(message)
+        if gdf is not None:
+            loaded.append(gdf)
+
+    if not loaded:
+        return None, 0, messages
+
+    combined = gpd.GeoDataFrame(
+        geometry=pd.concat([item.geometry for item in loaded], ignore_index=True),
+        crs="EPSG:4326",
+    )
+    return combined, len(combined), messages
+
+
+def simplify_for_map(gdf):
+    if gdf is None or gdf.empty:
+        return None
+
+    mapped = gdf.copy()
+    tolerance = 0.00003 if len(mapped) > 1000 else 0.00001
+    mapped["geometry"] = mapped.geometry.simplify(tolerance, preserve_topology=True)
+    mapped = mapped[mapped.geometry.notna()]
+    mapped = mapped[~mapped.geometry.is_empty]
+    return mapped
+
+
+def build_data_signature():
+    shp_files = find_shp_files(FLOOD_EXPECTED_DIR) + find_shp_files(FLOOD_HISTORY_DIR)
+    return tuple((str(path), path.stat().st_mtime, path.stat().st_size) for path in shp_files)
+
+
+@st.cache_data(show_spinner=False)
+def load_spatial_layers(signature):
+    if gpd is None:
+        return {
+            "expected": None,
+            "history_2022": None,
+            "history_2023": None,
+            "summary": [
+                {"name": "침수예상도", "files": 0, "features": 0},
+                {"name": "2022 침수흔적도", "files": 0, "features": 0},
+                {"name": "2023 침수흔적도", "files": 0, "features": 0},
+            ],
+            "messages": ["GeoPandas가 설치되어 있지 않아 SHP 파일을 읽을 수 없음"],
+        }
+
+    expected_files = find_shp_files(FLOOD_EXPECTED_DIR)
+    history_files = find_shp_files(FLOOD_HISTORY_DIR)
+    history_2022_files = [path for path in history_files if "2022" in path.name]
+    history_2023_files = [path for path in history_files if "2023" in path.name]
+
+    expected, expected_count, expected_messages = combine_shp_files(expected_files)
+    history_2022, history_2022_count, history_2022_messages = combine_shp_files(history_2022_files)
+    history_2023, history_2023_count, history_2023_messages = combine_shp_files(history_2023_files)
+
+    messages = []
+    if not expected_files:
+        messages.append("data/flood_expected 폴더에서 .shp 파일을 찾지 못함")
+    if not history_2022_files:
+        messages.append("data/flood_history 폴더에서 2022 .shp 파일을 찾지 못함")
+    if not history_2023_files:
+        messages.append("data/flood_history 폴더에서 2023 .shp 파일을 찾지 못함")
+
+    messages.extend(expected_messages)
+    messages.extend(history_2022_messages)
+    messages.extend(history_2023_messages)
+
+    return {
+        "expected": simplify_for_map(expected),
+        "history_2022": simplify_for_map(history_2022),
+        "history_2023": simplify_for_map(history_2023),
+        "summary": [
+            {"name": "침수예상도", "files": len(expected_files), "features": expected_count},
+            {"name": "2022 침수흔적도", "files": len(history_2022_files), "features": history_2022_count},
+            {"name": "2023 침수흔적도", "files": len(history_2023_files), "features": history_2023_count},
+        ],
+        "messages": messages,
+    }
+
+
+def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weight, show):
+    if gdf is None or gdf.empty:
+        return
+
+    folium.GeoJson(
+        data=gdf.to_json(drop_id=True),
+        name=name,
+        style_function=lambda _feature, color=color, fill_color=fill_color, fill_opacity=fill_opacity, weight=weight: {
+            "color": color,
+            "weight": weight,
+            "fillColor": fill_color,
+            "fillOpacity": fill_opacity,
+        },
+        smooth_factor=0.6,
+        show=show,
+    ).add_to(map_obj)
+
+
+def render_data_status_card(summary, messages):
+    rows = "".join(
+        f"""
+        <div class="data-row">
+            <span>{item["name"]}</span>
+            <b>{item["features"]:,}개</b>
+            <small>{item["files"]} file</small>
+        </div>
+        """
+        for item in summary
+    )
+    notes = "".join(f"<li>{message}</li>" for message in messages[:5])
+    notes_html = f"<ul>{notes}</ul>" if notes else "<p>모든 SHP 레이어를 정상적으로 불러왔습니다.</p>"
+
+    st.sidebar.markdown(
+        f"""
+<div class="sidebar-card">
+    <div class="sidebar-card-title">불러온 공간 데이터</div>
+    {rows}
+    <div class="sidebar-card-note">{notes_html}</div>
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
 
@@ -127,6 +305,67 @@ st.markdown(
         font-size: 25px;
         color: #172033;
         margin-bottom: 0;
+    }
+
+    .sidebar-card {
+        background: #ffffff;
+        border: 1px solid #dbe3ee;
+        border-radius: 8px;
+        padding: 14px;
+        margin-top: 20px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05);
+    }
+
+    .sidebar-card-title {
+        color: #172033;
+        font-size: 14px;
+        font-weight: 900;
+        margin-bottom: 10px;
+    }
+
+    .data-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 4px 8px;
+        padding: 9px 0;
+        border-top: 1px solid #edf2f7;
+    }
+
+    .data-row:first-of-type {
+        border-top: 0;
+    }
+
+    .data-row span {
+        font-size: 13px;
+        font-weight: 800;
+        color: #334155 !important;
+    }
+
+    .data-row b {
+        font-size: 13px;
+        color: #0f766e;
+    }
+
+    .data-row small {
+        grid-column: 1 / -1;
+        color: #64748b;
+        font-size: 12px;
+    }
+
+    .sidebar-card-note {
+        margin-top: 10px;
+        color: #64748b;
+        font-size: 12px;
+        line-height: 1.55;
+    }
+
+    .sidebar-card-note ul {
+        margin: 0;
+        padding-left: 18px;
+    }
+
+    .sidebar-card-note p {
+        margin: 0;
     }
 
     .hero {
@@ -366,12 +605,6 @@ rainfall = st.sidebar.selectbox(
     ["10mm/h", "30mm/h", "50mm/h"],
 )
 
-flood_year = st.sidebar.selectbox(
-    "침수흔적도 연도",
-    FLOOD_TRACE_YEARS,
-    index=FLOOD_TRACE_YEARS.index("2022"),
-)
-
 mode = st.sidebar.radio(
     "경로 추천 기준",
     ["최단경로", "안전경로"],
@@ -379,16 +612,20 @@ mode = st.sidebar.radio(
 
 risk = RISK_BY_RAINFALL[rainfall]
 
+with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
+    spatial_layers = load_spatial_layers(build_data_signature())
+
 st.sidebar.markdown(
     f"""
 <div style="margin-top:22px; color:#334155; font-size:15px; line-height:1.7;">
     선택한 강수량: <b>{rainfall}</b><br>
-    침수흔적도: <b>{flood_year}년</b><br>
     위험도: <b style="color:{risk['color']}">{risk['level']}</b>
 </div>
 """,
     unsafe_allow_html=True,
 )
+
+render_data_status_card(spatial_layers["summary"], spatial_layers["messages"])
 
 
 st.markdown(
@@ -412,12 +649,12 @@ st.markdown(
     <div class="metric-card">
         <div class="metric-label">분석 지역</div>
         <div class="metric-value">강남구</div>
-        <div class="metric-note">서울안전누리 공식 레이어</div>
+        <div class="metric-note">SHP 데이터 기반 시각화</div>
     </div>
     <div class="metric-card">
-        <div class="metric-label">침수흔적도</div>
-        <div class="metric-value">{flood_year}</div>
-        <div class="metric-note">태풍·호우 > 침수흔적도</div>
+        <div class="metric-label">지도 레이어</div>
+        <div class="metric-value">3종</div>
+        <div class="metric-note">예상도 · 2022 · 2023</div>
     </div>
     <div class="metric-card">
         <div class="metric-label">강수량 시나리오</div>
@@ -443,15 +680,38 @@ m = folium.Map(
     tiles="OpenStreetMap",
 )
 
-folium.raster_layers.ImageOverlay(
-    name=f"서울안전누리 침수흔적도 {flood_year}",
-    image=build_flood_trace_wms_url(flood_year),
-    bounds=FLOOD_TRACE_BOUNDS_WGS84,
-    opacity=0.62,
-    interactive=False,
-    cross_origin=False,
-    zindex=2,
-).add_to(m)
+add_polygon_layer(
+    m,
+    spatial_layers["expected"],
+    "침수예상도",
+    color="#0ea5e9",
+    fill_color="#38bdf8",
+    fill_opacity=0.22,
+    weight=1,
+    show=True,
+)
+
+add_polygon_layer(
+    m,
+    spatial_layers["history_2022"],
+    "2022 침수흔적도",
+    color="#f59e0b",
+    fill_color="#facc15",
+    fill_opacity=0.34,
+    weight=1,
+    show=True,
+)
+
+add_polygon_layer(
+    m,
+    spatial_layers["history_2023"],
+    "2023 침수흔적도",
+    color="#ef4444",
+    fill_color="#fb7185",
+    fill_opacity=0.28,
+    weight=1,
+    show=False,
+)
 
 folium.Marker(
     location=analysis_center,
@@ -476,8 +736,10 @@ legend_html = f"""
     font-size: 12px;
     box-shadow: 0 8px 22px rgba(15,23,42,0.14);
 ">
-    <div style="font-weight: 900; margin-bottom: 4px;">공식 침수흔적도</div>
-    <div><span style="display:inline-block;width:10px;height:10px;background:#f5e84a;border:1px solid #d4c900;margin-right:6px;"></span>{flood_year}년 침수흔적</div>
+    <div style="font-weight: 900; margin-bottom: 6px;">SHP 지도 레이어</div>
+    <div><span style="display:inline-block;width:10px;height:10px;background:#38bdf8;border:1px solid #0ea5e9;margin-right:6px;"></span>침수예상도</div>
+    <div><span style="display:inline-block;width:10px;height:10px;background:#facc15;border:1px solid #f59e0b;margin-right:6px;"></span>2022 침수흔적도</div>
+    <div><span style="display:inline-block;width:10px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
 </div>
 """
 m.get_root().html.add_child(folium.Element(legend_html))
@@ -486,11 +748,11 @@ st.markdown(
     f"""
 <div class="map-card">
     <div class="section-head">
-        <h3>침수흔적도 지도</h3>
-        <span>{flood_year}년 · {rainfall} · {mode}</span>
+        <h3>침수예상도 / 침수흔적도 지도</h3>
+        <span>{rainfall} · {mode}</span>
     </div>
     <div class="source-note">
-        데이터 출처: <a href="{SAFECITY_MAP_URL}" target="_blank">서울안전누리 안전정보지도 > 태풍·호우 > 침수흔적도</a>
+        데이터: <b>data/flood_expected</b>, <b>data/flood_history</b> 폴더의 압축 해제된 SHP 파일
     </div>
 """,
     unsafe_allow_html=True,
