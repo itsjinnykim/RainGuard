@@ -1,12 +1,7 @@
 import streamlit as st
 import folium
-import csv
-from pathlib import Path
+from urllib.parse import quote
 from streamlit_folium import st_folium
-
-
-BASE_DIR = Path(__file__).resolve().parent
-RISK_POINTS_PATH = BASE_DIR / "data" / "sample_risk_points.csv"
 
 
 st.set_page_config(
@@ -21,24 +16,46 @@ RISK_BY_RAINFALL = {
         "level": "낮음",
         "score": 32,
         "color": "#22c55e",
-        "circle": "green",
         "summary": "일부 저지대 주의",
     },
     "30mm/h": {
         "level": "주의",
         "score": 64,
         "color": "#f59e0b",
-        "circle": "orange",
         "summary": "침수 취약지 위험 상승",
     },
     "50mm/h": {
         "level": "높음",
         "score": 87,
         "color": "#ef4444",
-        "circle": "red",
         "summary": "우회 경로 권장",
     },
 }
+
+FLOOD_TRACE_YEARS = [
+    "2025",
+    "2024",
+    "2023",
+    "2022",
+    "2020",
+    "2019",
+    "2018",
+    "2017",
+    "2016",
+    "2014",
+    "2013",
+    "2012",
+    "2011",
+    "2010",
+]
+
+SAFECITY_MAP_URL = "https://safecity.seoul.go.kr/distFclt/cfMapDs/cfMapDs.page?menuId=MENU_SSNS_000014"
+SAFECITY_WMS_URL = "https://safecity.seoul.go.kr/G2DataService/GService"
+FLOOD_TRACE_BBOX_5186 = "179189.74,536547.41,216251.3,566863.54"
+FLOOD_TRACE_BOUNDS_WGS84 = [
+    [37.428075, 126.764023],
+    [37.701313, 127.184282],
+]
 
 RAIN_DROPS = "".join(
     f'<span style="left:{left}%; animation-delay:{delay}s; animation-duration:{duration}s;"></span>'
@@ -59,25 +76,13 @@ RAIN_DROPS = "".join(
 )
 
 
-def load_risk_points():
-    if not RISK_POINTS_PATH.exists():
-        return [
-            {"latitude": 37.5172, "longitude": 127.0473, "name": "구청 인근"},
-            {"latitude": 37.4981, "longitude": 127.0276, "name": "주요 역세권"},
-            {"latitude": 37.5045, "longitude": 127.0490, "name": "업무지구 인근"},
-            {"latitude": 37.5140, "longitude": 127.0600, "name": "간선도로 인근"},
-            {"latitude": 37.4897, "longitude": 127.0660, "name": "저지대 주거지 인근"},
-        ]
-
-    with RISK_POINTS_PATH.open("r", encoding="utf-8-sig", newline="") as file:
-        return [
-            {
-                "latitude": float(row["latitude"]),
-                "longitude": float(row["longitude"]),
-                "name": row["name"],
-            }
-            for row in csv.DictReader(file)
-        ]
+def build_flood_trace_wms_url(year):
+    layer_name = quote(f"수방 침수흔적도 {year}", safe="")
+    return (
+        f"{SAFECITY_WMS_URL}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap"
+        f"&FORMAT=image/png&TRANSPARENT=TRUE&LAYERS={layer_name}"
+        f"&CRS=EPSG:5186&BBOX={FLOOD_TRACE_BBOX_5186}&WIDTH=1100&HEIGHT=800"
+    )
 
 
 st.markdown(
@@ -230,6 +235,12 @@ st.markdown(
         box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
     }
 
+    .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+    }
+
     .metric-label {
         color: #64748b;
         font-size: 13px;
@@ -248,6 +259,19 @@ st.markdown(
         color: #64748b;
         font-size: 13px;
         margin-top: 7px;
+    }
+
+    .source-note {
+        margin-top: 10px;
+        color: #64748b;
+        font-size: 13px;
+        line-height: 1.55;
+    }
+
+    .source-note a {
+        color: #0369a1;
+        font-weight: 800;
+        text-decoration: none;
     }
 
     .map-card {
@@ -290,6 +314,12 @@ st.markdown(
         border-radius: 8px;
     }
 
+    @media (max-width: 1100px) {
+        .metric-grid {
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+    }
+
     @media (max-width: 760px) {
         .block-container {
             padding-left: 1rem;
@@ -310,6 +340,10 @@ st.markdown(
 
         .rain-field {
             width: 52%;
+        }
+
+        .metric-grid {
+            grid-template-columns: 1fr;
         }
     }
 </style>
@@ -332,6 +366,12 @@ rainfall = st.sidebar.selectbox(
     ["10mm/h", "30mm/h", "50mm/h"],
 )
 
+flood_year = st.sidebar.selectbox(
+    "침수흔적도 연도",
+    FLOOD_TRACE_YEARS,
+    index=FLOOD_TRACE_YEARS.index("2022"),
+)
+
 mode = st.sidebar.radio(
     "경로 추천 기준",
     ["최단경로", "안전경로"],
@@ -343,6 +383,7 @@ st.sidebar.markdown(
     f"""
 <div style="margin-top:22px; color:#334155; font-size:15px; line-height:1.7;">
     선택한 강수량: <b>{rainfall}</b><br>
+    침수흔적도: <b>{flood_year}년</b><br>
     위험도: <b style="color:{risk['color']}">{risk['level']}</b>
 </div>
 """,
@@ -365,42 +406,33 @@ st.markdown(
 )
 
 
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.markdown(
-        """
-<div class="metric-card">
-    <div class="metric-label">분석 지역</div>
-    <div class="metric-value">강남구</div>
+st.markdown(
+    f"""
+<div class="metric-grid">
+    <div class="metric-card">
+        <div class="metric-label">분석 지역</div>
+        <div class="metric-value">강남구</div>
+        <div class="metric-note">서울안전누리 공식 레이어</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-label">침수흔적도</div>
+        <div class="metric-value">{flood_year}</div>
+        <div class="metric-note">태풍·호우 > 침수흔적도</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-label">강수량 시나리오</div>
+        <div class="metric-value">{rainfall}</div>
+        <div class="metric-note">기상청 API 연동 예정</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-label">침수 위험도</div>
+        <div class="metric-value" style="color:{risk['color']}">{risk['level']}</div>
+        <div class="metric-note">{risk['score']}/100 · {risk['summary']}</div>
+    </div>
 </div>
 """,
-        unsafe_allow_html=True,
-    )
-
-with col2:
-    st.markdown(
-        f"""
-<div class="metric-card">
-    <div class="metric-label">강수량</div>
-    <div class="metric-value">{rainfall}</div>
-    <div class="metric-note">시나리오 기반 시연</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
-
-with col3:
-    st.markdown(
-        f"""
-<div class="metric-card">
-    <div class="metric-label">침수 위험도</div>
-    <div class="metric-value" style="color:{risk['color']}">{risk['level']}</div>
-    <div class="metric-note">{risk['score']}/100 · {risk['summary']}</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    unsafe_allow_html=True,
+)
 
 
 analysis_center = [37.5172, 127.0473]
@@ -411,29 +443,15 @@ m = folium.Map(
     tiles="OpenStreetMap",
 )
 
-risk_points = load_risk_points()
-
-for point in risk_points:
-    lat = point["latitude"]
-    lon = point["longitude"]
-    name = point["name"]
-
-    folium.Circle(
-        location=[lat, lon],
-        radius=360,
-        color=risk["circle"],
-        fill=True,
-        fill_color=risk["circle"],
-        fill_opacity=0.28,
-        weight=2,
-        tooltip=f"{name} · {risk['level']} 위험",
-        popup=f"""
-        <b>{name}</b><br>
-        강수량: {rainfall}<br>
-        침수 위험도: {risk['level']}<br>
-        위험 점수: {risk['score']}/100
-        """,
-    ).add_to(m)
+folium.raster_layers.ImageOverlay(
+    name=f"서울안전누리 침수흔적도 {flood_year}",
+    image=build_flood_trace_wms_url(flood_year),
+    bounds=FLOOD_TRACE_BOUNDS_WGS84,
+    opacity=0.62,
+    interactive=False,
+    cross_origin=False,
+    zindex=2,
+).add_to(m)
 
 folium.Marker(
     location=analysis_center,
@@ -442,12 +460,37 @@ folium.Marker(
     icon=folium.Icon(color="blue", icon="info-sign"),
 ).add_to(m)
 
+folium.LayerControl(collapsed=True).add_to(m)
+
+legend_html = f"""
+<div style="
+    position: fixed;
+    right: 28px;
+    bottom: 28px;
+    z-index: 9999;
+    background: rgba(255,255,255,0.94);
+    border: 1px solid #dbe3ee;
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: #172033;
+    font-size: 12px;
+    box-shadow: 0 8px 22px rgba(15,23,42,0.14);
+">
+    <div style="font-weight: 900; margin-bottom: 4px;">공식 침수흔적도</div>
+    <div><span style="display:inline-block;width:10px;height:10px;background:#f5e84a;border:1px solid #d4c900;margin-right:6px;"></span>{flood_year}년 침수흔적</div>
+</div>
+"""
+m.get_root().html.add_child(folium.Element(legend_html))
+
 st.markdown(
     f"""
 <div class="map-card">
     <div class="section-head">
-    <h3>침수 위험 지도</h3>
-        <span>{rainfall} · {mode} · 위험도 {risk['score']}/100</span>
+        <h3>침수흔적도 지도</h3>
+        <span>{flood_year}년 · {rainfall} · {mode}</span>
+    </div>
+    <div class="source-note">
+        데이터 출처: <a href="{SAFECITY_MAP_URL}" target="_blank">서울안전누리 안전정보지도 > 태풍·호우 > 침수흔적도</a>
     </div>
 """,
     unsafe_allow_html=True,
