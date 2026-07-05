@@ -17,6 +17,11 @@ try:
 except ImportError:
     gpd = None
 
+try:
+    import joblib
+except ImportError:
+    joblib = None
+
 
 st.set_page_config(
     page_title="RainGuard",
@@ -29,6 +34,24 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 FLOOD_EXPECTED_DIR = DATA_DIR / "flood_expected"
 FLOOD_HISTORY_DIR = DATA_DIR / "flood_history"
+FLOOD_DATASET_PATH = DATA_DIR / "processed" / "flood_dataset.csv"
+MODEL_DIR = BASE_DIR / "models"
+MODEL_PATH = MODEL_DIR / "flood_random_forest.joblib"
+MODEL_METRICS_PATH = MODEL_DIR / "model_metrics.csv"
+
+AI_FEATURE_COLUMNS = [
+    "latitude",
+    "longitude",
+    "rainfall_mm_h",
+    "display_expected_stage_max",
+    "expected_stage",
+    "flood_expected",
+    "flood_history_2022",
+    "flood_history_2023",
+    "flood_history",
+    "history_polygon_count",
+    "distance_to_flood_area_m",
+]
 
 RISK_BY_RAINFALL = {
     "10mm/h": {
@@ -268,6 +291,138 @@ def load_spatial_layers(signature):
         ],
         "messages": messages,
     }
+
+
+def build_ai_signature():
+    paths = [FLOOD_DATASET_PATH, MODEL_PATH, MODEL_METRICS_PATH]
+    return tuple(
+        (str(path), path.stat().st_mtime, path.stat().st_size)
+        for path in paths
+        if path.exists()
+    )
+
+
+@st.cache_data(show_spinner=False)
+def load_ai_dataset(signature):
+    if not FLOOD_DATASET_PATH.exists():
+        return pd.DataFrame()
+    return pd.read_csv(FLOOD_DATASET_PATH)
+
+
+@st.cache_resource(show_spinner=False)
+def load_ai_model(signature):
+    if joblib is None or not MODEL_PATH.exists():
+        return None
+
+    payload = joblib.load(MODEL_PATH)
+    if isinstance(payload, dict) and "model" in payload:
+        return payload
+    return {
+        "model": payload,
+        "features": AI_FEATURE_COLUMNS,
+        "target": "scenario_flood_label",
+    }
+
+
+@st.cache_data(show_spinner=False)
+def load_ai_metrics(signature):
+    if not MODEL_METRICS_PATH.exists():
+        return {}
+    metrics_df = pd.read_csv(MODEL_METRICS_PATH)
+    return dict(zip(metrics_df["metric"], metrics_df["value"]))
+
+
+def format_percent(value, decimals=1):
+    if value is None:
+        return "-"
+    return f"{value * 100:.{decimals}f}%"
+
+
+def ai_risk_color(probability):
+    if probability >= 0.75:
+        return "#7e22ce"
+    if probability >= 0.5:
+        return "#398fca"
+    if probability >= 0.25:
+        return "#359fa1"
+    return "#d7cf2f"
+
+
+def get_ai_predictions(rainfall):
+    signature = build_ai_signature()
+    dataset = load_ai_dataset(signature)
+    model_payload = load_ai_model(signature)
+    metrics = load_ai_metrics(signature)
+
+    if dataset.empty or model_payload is None:
+        return pd.DataFrame(), {
+            "ready": False,
+            "avg_probability": None,
+            "risk_cell_count": 0,
+            "recall": metrics.get("recall"),
+            "f1_score": metrics.get("f1_score"),
+            "roc_auc": metrics.get("roc_auc"),
+        }
+
+    scenario_df = dataset[dataset["rainfall_scenario"] == rainfall].copy()
+    if scenario_df.empty:
+        return pd.DataFrame(), {
+            "ready": False,
+            "avg_probability": None,
+            "risk_cell_count": 0,
+            "recall": metrics.get("recall"),
+            "f1_score": metrics.get("f1_score"),
+            "roc_auc": metrics.get("roc_auc"),
+        }
+
+    features = model_payload.get("features", AI_FEATURE_COLUMNS)
+    missing = [feature for feature in features if feature not in scenario_df.columns]
+    if missing:
+        return pd.DataFrame(), {
+            "ready": False,
+            "avg_probability": None,
+            "risk_cell_count": 0,
+            "recall": metrics.get("recall"),
+            "f1_score": metrics.get("f1_score"),
+            "roc_auc": metrics.get("roc_auc"),
+        }
+
+    model = model_payload["model"]
+    X = scenario_df[features].apply(pd.to_numeric, errors="coerce").fillna(0)
+    probabilities = model.predict_proba(X)[:, 1]
+    labels = model.predict(X)
+    scenario_df["ai_risk_probability"] = probabilities
+    scenario_df["ai_predicted_label"] = labels
+
+    return scenario_df, {
+        "ready": True,
+        "avg_probability": float(probabilities.mean()),
+        "risk_cell_count": int(labels.sum()),
+        "recall": metrics.get("recall"),
+        "f1_score": metrics.get("f1_score"),
+        "roc_auc": metrics.get("roc_auc"),
+    }
+
+
+def add_ai_prediction_layer(map_obj, prediction_df, show):
+    if prediction_df.empty:
+        return
+
+    layer = folium.FeatureGroup(name="AI 예측", show=show)
+    for row in prediction_df.itertuples(index=False):
+        probability = float(row.ai_risk_probability)
+        color = ai_risk_color(probability)
+        folium.CircleMarker(
+            location=[row.latitude, row.longitude],
+            radius=3.2 + probability * 4.8,
+            color=color,
+            weight=0,
+            fill=True,
+            fill_color=color,
+            fill_opacity=0.58,
+            tooltip=f"AI {probability * 100:.0f}%",
+        ).add_to(layer)
+    layer.add_to(map_obj)
 
 
 def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weight, show, dash_array=None):
@@ -705,8 +860,14 @@ st.sidebar.markdown(
 show_expected = st.sidebar.checkbox("침수예상도 표시", value=True)
 show_history_2022 = st.sidebar.checkbox("2022 침수흔적도 표시", value=True)
 show_history_2023 = st.sidebar.checkbox("2023 침수흔적도 표시", value=False)
+show_ai_layer = st.sidebar.checkbox("AI 예측", value=True)
 
 risk = RISK_BY_RAINFALL[rainfall]
+ai_predictions, ai_summary = get_ai_predictions(rainfall)
+ai_avg_text = format_percent(ai_summary["avg_probability"], 1)
+ai_recall_text = format_percent(ai_summary["recall"], 1)
+ai_cells_text = f"{ai_summary['risk_cell_count']:,}개" if ai_summary["ready"] else "-"
+ai_color = ai_risk_color(ai_summary["avg_probability"] or 0)
 
 with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
     spatial_layers = load_spatial_layers(build_data_signature())
@@ -763,22 +924,22 @@ st.markdown(
     <div class="metric-card">
         <div class="metric-label">분석 지역</div>
         <div class="metric-value">강남구</div>
-        <div class="metric-note">SHP 데이터 기반 시각화</div>
+        <div class="metric-note">SHP + AI</div>
     </div>
     <div class="metric-card">
-        <div class="metric-label">침수예상도 단계</div>
-        <div class="metric-value">{expected_stage_label}</div>
-        <div class="metric-note">강수량 시나리오 적용</div>
-    </div>
-    <div class="metric-card">
-        <div class="metric-label">강수량 시나리오</div>
+        <div class="metric-label">강수량</div>
         <div class="metric-value">{rainfall}</div>
-        <div class="metric-note">기상청 API 연동 예정</div>
+        <div class="metric-note">{expected_stage_label}</div>
     </div>
     <div class="metric-card">
-        <div class="metric-label">침수 위험도</div>
-        <div class="metric-value" style="color:{risk['color']}">{risk['level']}</div>
-        <div class="metric-note">{risk['score']}/100 · {risk['summary']}</div>
+        <div class="metric-label">AI 위험확률</div>
+        <div class="metric-value" style="color:{ai_color}">{ai_avg_text}</div>
+        <div class="metric-note">평균 예측값</div>
+    </div>
+    <div class="metric-card">
+        <div class="metric-label">위험 격자</div>
+        <div class="metric-value">{ai_cells_text}</div>
+        <div class="metric-note">Recall {ai_recall_text}</div>
     </div>
 </div>
 """,
@@ -839,6 +1000,8 @@ add_polygon_layer(
     dash_array="4",
 )
 
+add_ai_prediction_layer(m, ai_predictions, show_ai_layer)
+
 folium.Marker(
     location=analysis_center,
     popup="RainGuard 분석 중심",
@@ -873,9 +1036,10 @@ legend_html = f"""
     font-size: 12px;
     box-shadow: 0 8px 22px rgba(15,23,42,0.14);
 ">
-    <div style="font-weight: 900; margin-bottom: 6px;">침수예상도 단계</div>
+    <div style="font-weight: 900; margin-bottom: 6px;">SHP 침수심</div>
     {expected_legend_rows}
     <div style="height:1px;background:#e2e8f0;margin:9px 0 7px;"></div>
+    <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#7e22ce;margin-right:6px;"></span>AI 예측</div>
     <div><span style="display:inline-block;width:18px;height:10px;background:#facc15;border:1px solid #d97706;margin-right:6px;"></span>2022 침수흔적도</div>
     <div><span style="display:inline-block;width:18px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
 </div>
@@ -886,11 +1050,11 @@ st.markdown(
     f"""
 <div class="map-card">
     <div class="section-head">
-        <h3>침수예상도 / 침수흔적도 지도</h3>
-        <span>{rainfall} · {expected_stage_label} · {mode}</span>
+        <h3>RainGuard Map</h3>
+        <span>{rainfall} · AI + SHP</span>
     </div>
     <div class="source-note">
-        데이터: <b>data/flood_expected</b>, <b>data/flood_history</b> 폴더의 압축 해제된 SHP 파일 · 2022/2023 침수흔적도는 우측 레이어 버튼에서 켤 수 있습니다.
+        AI 예측 원 + 공공데이터 SHP 레이어
     </div>
 """,
     unsafe_allow_html=True,
@@ -898,7 +1062,7 @@ st.markdown(
 
 map_key = (
     f"rainguard_map_{rainfall}_{show_expected}_"
-    f"{show_history_2022}_{show_history_2023}_{expected_stage_label}"
+    f"{show_history_2022}_{show_history_2023}_{show_ai_layer}_{expected_stage_label}"
 )
 st_folium(m, width=1240, height=620, key=map_key)
 
