@@ -89,6 +89,21 @@ EXPECTED_STAGE_STYLE = {
     6: {"label": "3.0m~", "color": "#7e22ce", "fill": "#a855f7", "opacity": 0.44},
 }
 
+AI_RISK_GRID_THRESHOLD = 0.5
+AI_RISK_STYLE = {
+    "낮음": {"color": "#d7cf2f", "fill": "#fff7a3"},
+    "주의": {"color": "#73c9c8", "fill": "#b6ece8"},
+    "높음": {"color": "#398fca", "fill": "#8fd3ff"},
+    "매우 높음": {"color": "#7e22ce", "fill": "#c084fc"},
+}
+
+ANALYSIS_BOUNDS = {
+    "min_lon": 127.013,
+    "min_lat": 37.456,
+    "max_lon": 127.124,
+    "max_lat": 37.536,
+}
+
 RAIN_DROPS = "".join(
     f'<span style="left:{left}%; animation-delay:{delay}s; animation-duration:{duration}s;"></span>'
     for left, delay, duration in [
@@ -210,12 +225,30 @@ def combine_gdfs(gdfs):
     )
 
 
+def clip_to_analysis_bounds(gdf):
+    if gdf is None or gdf.empty:
+        return gdf
+    return gdf.cx[
+        ANALYSIS_BOUNDS["min_lon"] : ANALYSIS_BOUNDS["max_lon"],
+        ANALYSIS_BOUNDS["min_lat"] : ANALYSIS_BOUNDS["max_lat"],
+    ].copy()
+
+
 def simplify_for_map(gdf):
     if gdf is None or gdf.empty:
         return None
 
-    mapped = gdf.copy()
-    tolerance = 0.00003 if len(mapped) > 1000 else 0.00001
+    mapped = clip_to_analysis_bounds(gdf)
+    if mapped is None or mapped.empty:
+        return None
+
+    if len(mapped) > 5000:
+        tolerance = 0.00008
+    elif len(mapped) > 1000:
+        tolerance = 0.00005
+    else:
+        tolerance = 0.00001
+
     mapped["geometry"] = mapped.geometry.simplify(tolerance, preserve_topology=True)
     mapped = mapped[mapped.geometry.notna()]
     mapped = mapped[~mapped.geometry.is_empty]
@@ -339,13 +372,21 @@ def format_percent(value, decimals=1):
 
 
 def ai_risk_color(probability):
-    if probability >= 0.75:
-        return "#7e22ce"
+    return AI_RISK_STYLE[ai_risk_grade(probability)]["color"]
+
+
+def ai_risk_fill(probability):
+    return AI_RISK_STYLE[ai_risk_grade(probability)]["fill"]
+
+
+def ai_risk_grade(probability):
+    if probability >= 0.85:
+        return "매우 높음"
+    if probability >= 0.68:
+        return "높음"
     if probability >= 0.5:
-        return "#398fca"
-    if probability >= 0.25:
-        return "#359fa1"
-    return "#d7cf2f"
+        return "주의"
+    return "낮음"
 
 
 def get_ai_predictions(rainfall):
@@ -404,25 +445,87 @@ def get_ai_predictions(rainfall):
     }
 
 
-def add_ai_prediction_layer(map_obj, prediction_df, show):
+def estimate_grid_step(values, fallback):
+    unique_values = sorted(set(round(float(value), 6) for value in values))
+    diffs = [
+        unique_values[index + 1] - unique_values[index]
+        for index in range(len(unique_values) - 1)
+        if unique_values[index + 1] - unique_values[index] > 0
+    ]
+    if not diffs:
+        return fallback
+    return float(pd.Series(diffs).median())
+
+
+def build_ai_grid_geojson(prediction_df):
     if prediction_df.empty:
+        return None
+
+    visible_df = prediction_df[
+        prediction_df["ai_risk_probability"] >= AI_RISK_GRID_THRESHOLD
+    ].copy()
+    if visible_df.empty:
+        return None
+
+    lat_step = estimate_grid_step(prediction_df["latitude"], 0.0045)
+    lon_step = estimate_grid_step(prediction_df["longitude"], 0.0057)
+
+    features = []
+    for row in visible_df.itertuples(index=False):
+        probability = float(row.ai_risk_probability)
+        west = float(row.longitude) - lon_step / 2
+        east = float(row.longitude) + lon_step / 2
+        south = float(row.latitude) - lat_step / 2
+        north = float(row.latitude) + lat_step / 2
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "grid_id": row.grid_id,
+                    "probability": probability,
+                    "probability_text": f"{probability * 100:.0f}%",
+                    "risk": ai_risk_grade(probability),
+                },
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [
+                            [west, south],
+                            [east, south],
+                            [east, north],
+                            [west, north],
+                            [west, south],
+                        ]
+                    ],
+                },
+            }
+        )
+
+    return {"type": "FeatureCollection", "features": features}
+
+
+def add_ai_prediction_layer(map_obj, prediction_df, show):
+    grid_geojson = build_ai_grid_geojson(prediction_df)
+    if grid_geojson is None:
         return
 
-    layer = folium.FeatureGroup(name="AI 예측", show=show)
-    for row in prediction_df.itertuples(index=False):
-        probability = float(row.ai_risk_probability)
-        color = ai_risk_color(probability)
-        folium.CircleMarker(
-            location=[row.latitude, row.longitude],
-            radius=3.2 + probability * 4.8,
-            color=color,
-            weight=0,
-            fill=True,
-            fill_color=color,
-            fill_opacity=0.58,
-            tooltip=f"AI {probability * 100:.0f}%",
-        ).add_to(layer)
-    layer.add_to(map_obj)
+    folium.GeoJson(
+        data=grid_geojson,
+        name="AI 위험 격자",
+        style_function=lambda feature: {
+            "color": ai_risk_color(feature["properties"]["probability"]),
+            "weight": 0.7,
+            "fillColor": ai_risk_fill(feature["properties"]["probability"]),
+            "fillOpacity": min(0.55, 0.22 + feature["properties"]["probability"] * 0.32),
+        },
+        tooltip=folium.GeoJsonTooltip(
+            fields=["probability_text", "risk"],
+            aliases=["AI", "Risk"],
+            sticky=False,
+        ),
+        smooth_factor=0.3,
+        show=show,
+    ).add_to(map_obj)
 
 
 def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weight, show, dash_array=None):
@@ -858,7 +961,7 @@ st.sidebar.markdown(
 )
 
 show_expected = st.sidebar.checkbox("침수예상도 표시", value=True)
-show_history_2022 = st.sidebar.checkbox("2022 침수흔적도 표시", value=True)
+show_history_2022 = st.sidebar.checkbox("2022 침수흔적도 표시", value=False)
 show_history_2023 = st.sidebar.checkbox("2023 침수흔적도 표시", value=False)
 show_ai_layer = st.sidebar.checkbox("AI 예측", value=True)
 
@@ -953,6 +1056,7 @@ m = folium.Map(
     location=analysis_center,
     zoom_start=13,
     tiles="CartoDB positron",
+    prefer_canvas=True,
 )
 
 tile_filter_css = """
@@ -1039,7 +1143,11 @@ legend_html = f"""
     <div style="font-weight: 900; margin-bottom: 6px;">SHP 침수심</div>
     {expected_legend_rows}
     <div style="height:1px;background:#e2e8f0;margin:9px 0 7px;"></div>
-    <div><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#7e22ce;margin-right:6px;"></span>AI 예측</div>
+    <div style="font-weight: 900; margin-bottom: 5px;">AI Grid</div>
+    <div><span style="display:inline-block;width:18px;height:10px;background:#b6ece8;border:1px solid #73c9c8;margin-right:6px;"></span>50%+</div>
+    <div><span style="display:inline-block;width:18px;height:10px;background:#8fd3ff;border:1px solid #398fca;margin-right:6px;"></span>68%+</div>
+    <div><span style="display:inline-block;width:18px;height:10px;background:#c084fc;border:1px solid #7e22ce;margin-right:6px;"></span>85%+</div>
+    <div style="height:1px;background:#e2e8f0;margin:9px 0 7px;"></div>
     <div><span style="display:inline-block;width:18px;height:10px;background:#facc15;border:1px solid #d97706;margin-right:6px;"></span>2022 침수흔적도</div>
     <div><span style="display:inline-block;width:18px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
 </div>
@@ -1054,7 +1162,7 @@ st.markdown(
         <span>{rainfall} · AI + SHP</span>
     </div>
     <div class="source-note">
-        AI 예측 원 + 공공데이터 SHP 레이어
+        AI 위험 격자 + SHP 레이어
     </div>
 """,
     unsafe_allow_html=True,
