@@ -90,12 +90,12 @@ EXPECTED_STAGE_BY_RAINFALL = {
 }
 
 EXPECTED_STAGE_STYLE = {
-    1: {"label": "~0.5m", "color": "#d7cf2f", "fill": "#fff86a", "opacity": 0.46},
-    2: {"label": "0.5~1.0m", "color": "#a9d94a", "fill": "#ccff66", "opacity": 0.43},
-    3: {"label": "1.0~1.5m", "color": "#25c189", "fill": "#66f0bd", "opacity": 0.42},
-    4: {"label": "1.5~2.0m", "color": "#359fa1", "fill": "#73c9c8", "opacity": 0.42},
-    5: {"label": "2.0~3.0m", "color": "#398fca", "fill": "#72c9ff", "opacity": 0.42},
-    6: {"label": "3.0m~", "color": "#7e22ce", "fill": "#a855f7", "opacity": 0.44},
+    1: {"label": "~0.5m", "color": "#d7cf2f", "fill": "#fff86a", "opacity": 0.15},
+    2: {"label": "0.5~1.0m", "color": "#a9d94a", "fill": "#ccff66", "opacity": 0.16},
+    3: {"label": "1.0~1.5m", "color": "#25c189", "fill": "#66f0bd", "opacity": 0.17},
+    4: {"label": "1.5~2.0m", "color": "#359fa1", "fill": "#73c9c8", "opacity": 0.18},
+    5: {"label": "2.0~3.0m", "color": "#398fca", "fill": "#72c9ff", "opacity": 0.20},
+    6: {"label": "3.0m~", "color": "#7e22ce", "fill": "#a855f7", "opacity": 0.22},
 }
 
 AI_RISK_GRID_THRESHOLD = 0.5
@@ -568,7 +568,7 @@ def add_ai_prediction_layer(map_obj, prediction_df, show):
             "color": ai_risk_color(feature["properties"]["probability"]),
             "weight": 0.7,
             "fillColor": ai_risk_fill(feature["properties"]["probability"]),
-            "fillOpacity": min(0.55, 0.22 + feature["properties"]["probability"] * 0.32),
+            "fillOpacity": min(0.28, 0.08 + feature["properties"]["probability"] * 0.20),
         },
         tooltip=folium.GeoJsonTooltip(
             fields=["probability_text", "risk"],
@@ -1108,9 +1108,18 @@ analysis_center = [37.5172, 127.0473]
 m = folium.Map(
     location=analysis_center,
     zoom_start=13,
-    tiles="OpenStreetMap",
+    tiles="CartoDB positron",
     prefer_canvas=True,
 )
+
+tile_tone_css = """
+<style>
+    .leaflet-tile-pane img {
+        filter: contrast(1.08) saturate(1.05) brightness(0.98);
+    }
+</style>
+"""
+m.get_root().header.add_child(folium.Element(tile_tone_css))
 
 for stage in visible_expected_stages:
     style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
@@ -1226,7 +1235,7 @@ st.markdown(
 )
 
 map_key = (
-    f"rainguard_map_osm_{rainfall}_{show_expected}_"
+    f"rainguard_map_positron_soft_layers_{rainfall}_{show_expected}_"
     f"{show_history_2022}_{show_history_2023}_{show_history_other}_"
     f"{show_ai_layer}_{expected_stage_label}"
 )
