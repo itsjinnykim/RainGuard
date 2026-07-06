@@ -36,6 +36,8 @@ RAINFALL_SCENARIOS = {
     "30mm/h": {"rainfall_mm_h": 30, "max_expected_stage": 4, "risk_multiplier": 1.05},
     "50mm/h": {"rainfall_mm_h": 50, "max_expected_stage": 6, "risk_multiplier": 1.3},
 }
+KEY_HISTORY_YEARS = (2022, 2023)
+RECENT_HISTORY_WINDOW_YEARS = 5
 
 # Fallback extent used only when a boundary GeoJSON is not available.
 GANGNAM_BOUNDS_WGS84 = {
@@ -258,31 +260,79 @@ def add_expected_features(grid: gpd.GeoDataFrame, expected: gpd.GeoDataFrame) ->
 
 def add_history_features(grid: gpd.GeoDataFrame, history: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     grid = grid.copy()
-    for year in (2022, 2023):
-        year_history = history[history["history_year"] == year].copy()
+    for year in KEY_HISTORY_YEARS:
+        grid[f"history_{year}_polygon_count"] = 0
+        grid[f"flood_history_{year}"] = 0
+
+    grid["history_polygon_count"] = 0
+    grid["history_recent_polygon_count"] = 0
+    grid["history_old_polygon_count"] = 0
+    grid["flood_history"] = 0
+    grid["flood_history_recent"] = 0
+    grid["flood_history_old"] = 0
+    grid["history_year_count"] = 0
+    grid["latest_history_year"] = 0
+    grid["years_since_latest_history"] = 99
+    grid["history_recency_score"] = 0.0
+
+    if history.empty:
+        return grid
+
+    history = history.copy()
+    history["history_year"] = pd.to_numeric(history["history_year"], errors="coerce")
+    known_years = history["history_year"].dropna()
+    latest_source_year = int(known_years.max()) if not known_years.empty else max(KEY_HISTORY_YEARS)
+    recent_cutoff_year = latest_source_year - RECENT_HISTORY_WINDOW_YEARS + 1
+    history["history_recency_weight"] = history["history_year"].apply(
+        lambda value: history_recency_weight(value, latest_source_year)
+    )
+
+    joined = gpd.sjoin(
+        grid[["grid_id", "geometry"]],
+        history[["history_year", "history_recency_weight", "geometry"]],
+        how="left",
+        predicate="intersects",
+    )
+    matched = joined[joined["index_right"].notna()].copy()
+
+    if matched.empty:
+        return grid
+
+    counts = matched.groupby("grid_id").size()
+    grid["history_polygon_count"] = grid["grid_id"].map(counts).fillna(0).astype(int)
+
+    for year in KEY_HISTORY_YEARS:
+        year_counts = matched[matched["history_year"] == year].groupby("grid_id").size()
         count_col = f"history_{year}_polygon_count"
         flag_col = f"flood_history_{year}"
-
-        if year_history.empty:
-            grid[count_col] = 0
-            grid[flag_col] = 0
-            continue
-
-        joined = gpd.sjoin(
-            grid[["grid_id", "geometry"]],
-            year_history[["geometry"]],
-            how="left",
-            predicate="intersects",
-        )
-        counts = joined[joined["index_right"].notna()].groupby("grid_id").size()
-        grid[count_col] = grid["grid_id"].map(counts).fillna(0).astype(int)
+        grid[count_col] = grid["grid_id"].map(year_counts).fillna(0).astype(int)
         grid[flag_col] = (grid[count_col] > 0).astype(int)
 
-    grid["history_polygon_count"] = (
-        grid["history_2022_polygon_count"] + grid["history_2023_polygon_count"]
-    )
+    recent_counts = matched[matched["history_year"] >= recent_cutoff_year].groupby("grid_id").size()
+    old_counts = matched[matched["history_year"] < recent_cutoff_year].groupby("grid_id").size()
+    history_year_counts = matched.groupby("grid_id")["history_year"].nunique()
+    latest_years = matched.groupby("grid_id")["history_year"].max()
+    recency_scores = matched.groupby("grid_id")["history_recency_weight"].sum()
+
+    grid["history_recent_polygon_count"] = grid["grid_id"].map(recent_counts).fillna(0).astype(int)
+    grid["history_old_polygon_count"] = grid["grid_id"].map(old_counts).fillna(0).astype(int)
+    grid["flood_history_recent"] = (grid["history_recent_polygon_count"] > 0).astype(int)
+    grid["flood_history_old"] = (grid["history_old_polygon_count"] > 0).astype(int)
+    grid["history_year_count"] = grid["grid_id"].map(history_year_counts).fillna(0).astype(int)
+    grid["latest_history_year"] = grid["grid_id"].map(latest_years).fillna(0).astype(int)
+    grid["years_since_latest_history"] = (
+        latest_source_year - grid["latest_history_year"]
+    ).where(grid["latest_history_year"] > 0, 99).astype(int)
+    grid["history_recency_score"] = grid["grid_id"].map(recency_scores).fillna(0).round(3)
     grid["flood_history"] = (grid["history_polygon_count"] > 0).astype(int)
     return grid
+
+
+def history_recency_weight(year, latest_source_year: int) -> float:
+    if pd.isna(year):
+        return 0.4
+    age = max(latest_source_year - int(year), 0)
+    return round(max(0.2, 1 - age * 0.06), 3)
 
 
 def union_geometry(gdf: gpd.GeoDataFrame):
@@ -327,11 +377,19 @@ def expand_rainfall_scenarios(grid: gpd.GeoDataFrame) -> pd.DataFrame:
             "flood_history_2022": grid["flood_history_2022"].astype(int),
             "flood_history_2023": grid["flood_history_2023"].astype(int),
             "flood_history": grid["flood_history"].astype(int),
+            "flood_history_recent": grid["flood_history_recent"].astype(int),
+            "flood_history_old": grid["flood_history_old"].astype(int),
             "history_polygon_count": grid["history_polygon_count"].astype(int),
+            "history_recent_polygon_count": grid["history_recent_polygon_count"].astype(int),
+            "history_old_polygon_count": grid["history_old_polygon_count"].astype(int),
+            "history_year_count": grid["history_year_count"].astype(int),
+            "latest_history_year": grid["latest_history_year"].astype(int),
+            "years_since_latest_history": grid["years_since_latest_history"].astype(int),
+            "history_recency_score": grid["history_recency_score"].astype(float),
             "distance_to_flood_area_m": grid["distance_to_flood_area_m"],
         }
     )
-    base["flood_label"] = ((base["flood_expected"] == 1) | (base["flood_history"] == 1)).astype(int)
+    base["flood_label"] = ((base["flood_expected"] == 1) | (base["flood_history_recent"] == 1)).astype(int)
 
     scenario_frames = []
     for scenario_name, scenario in RAINFALL_SCENARIOS.items():
@@ -345,14 +403,17 @@ def expand_rainfall_scenarios(grid: gpd.GeoDataFrame) -> pd.DataFrame:
         ).astype(int)
         scenario_df["scenario_flood_label"] = (
             (scenario_df["scenario_expected_visible"] == 1)
-            | (scenario_df["flood_history"] == 1)
+            | (scenario_df["flood_history_recent"] == 1)
         ).astype(int)
 
         proximity = (1 - scenario_df["distance_to_flood_area_m"].fillna(3000) / 1500).clip(0, 1)
         depth_weight = scenario_df["expected_stage"] / 6
+        recency_weight = (scenario_df["history_recency_score"] / 3).clip(0, 1)
         raw_score = (
             scenario_df["scenario_expected_visible"] * 38
-            + scenario_df["flood_history"] * 35
+            + scenario_df["flood_history_recent"] * 28
+            + scenario_df["flood_history_old"] * 8
+            + recency_weight * 12
             + depth_weight * 17
             + proximity * 10
         )
@@ -376,7 +437,15 @@ def expand_rainfall_scenarios(grid: gpd.GeoDataFrame) -> pd.DataFrame:
         "flood_history_2022",
         "flood_history_2023",
         "flood_history",
+        "flood_history_recent",
+        "flood_history_old",
         "history_polygon_count",
+        "history_recent_polygon_count",
+        "history_old_polygon_count",
+        "history_year_count",
+        "latest_history_year",
+        "years_since_latest_history",
+        "history_recency_score",
         "distance_to_flood_area_m",
         "scenario_risk_score",
         "risk_grade",

@@ -51,7 +51,14 @@ AI_FEATURE_COLUMNS = [
     "flood_history_2022",
     "flood_history_2023",
     "flood_history",
+    "flood_history_recent",
+    "flood_history_old",
     "history_polygon_count",
+    "history_recent_polygon_count",
+    "history_old_polygon_count",
+    "history_year_count",
+    "years_since_latest_history",
+    "history_recency_score",
     "distance_to_flood_area_m",
 ]
 
@@ -269,10 +276,12 @@ def load_spatial_layers(signature):
             "expected_by_stage": {},
             "history_2022": None,
             "history_2023": None,
+            "history_other": None,
             "summary": [
                 {"name": "침수예상도", "files": 0, "features": 0},
                 {"name": "2022 침수흔적도", "files": 0, "features": 0},
                 {"name": "2023 침수흔적도", "files": 0, "features": 0},
+                {"name": "과거 침수흔적도", "files": 0, "features": 0},
             ],
             "messages": ["GeoPandas가 설치되어 있지 않아 SHP 파일을 읽을 수 없음"],
         }
@@ -281,6 +290,9 @@ def load_spatial_layers(signature):
     history_files = find_shp_files(FLOOD_HISTORY_DIR)
     history_2022_files = [path for path in history_files if "2022" in path.name]
     history_2023_files = [path for path in history_files if "2023" in path.name]
+    history_other_files = [
+        path for path in history_files if "2022" not in path.name and "2023" not in path.name
+    ]
 
     expected_by_stage = {}
     expected_stage_counts = {}
@@ -301,6 +313,7 @@ def load_spatial_layers(signature):
     expected_count = sum(expected_stage_counts.values())
     history_2022, history_2022_count, history_2022_messages = combine_shp_files(history_2022_files)
     history_2023, history_2023_count, history_2023_messages = combine_shp_files(history_2023_files)
+    history_other, history_other_count, history_other_messages = combine_shp_files(history_other_files)
 
     messages = []
     if not expected_files:
@@ -313,16 +326,19 @@ def load_spatial_layers(signature):
     messages.extend(expected_messages)
     messages.extend(history_2022_messages)
     messages.extend(history_2023_messages)
+    messages.extend(history_other_messages)
 
     return {
         "expected_by_stage": expected_by_stage,
         "expected_stage_counts": expected_stage_counts,
         "history_2022": simplify_for_map(history_2022),
         "history_2023": simplify_for_map(history_2023),
+        "history_other": simplify_for_map(history_other),
         "summary": [
             {"name": "침수예상도", "files": len(expected_files), "features": expected_count},
             {"name": "2022 침수흔적도", "files": len(history_2022_files), "features": history_2022_count},
             {"name": "2023 침수흔적도", "files": len(history_2023_files), "features": history_2023_count},
+            {"name": "과거 침수흔적도", "files": len(history_other_files), "features": history_other_count},
         ],
         "messages": messages,
     }
@@ -999,6 +1015,7 @@ st.sidebar.markdown(
 show_expected = st.sidebar.checkbox("침수예상도 표시", value=True)
 show_history_2022 = st.sidebar.checkbox("2022 침수흔적도 표시", value=False)
 show_history_2023 = st.sidebar.checkbox("2023 침수흔적도 표시", value=False)
+show_history_other = st.sidebar.checkbox("과거 침수흔적도 표시", value=False)
 show_ai_layer = st.sidebar.checkbox("AI 예측", value=True)
 
 risk = RISK_BY_RAINFALL[rainfall]
@@ -1095,15 +1112,6 @@ m = folium.Map(
     prefer_canvas=True,
 )
 
-tile_filter_css = """
-<style>
-    .leaflet-tile-pane img {
-        filter: saturate(0.52) contrast(0.92) brightness(1.06);
-    }
-</style>
-"""
-m.get_root().header.add_child(folium.Element(tile_filter_css))
-
 for stage in visible_expected_stages:
     style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
     add_polygon_layer(
@@ -1138,6 +1146,18 @@ add_polygon_layer(
     weight=1.8,
     show=show_history_2023,
     dash_array="4",
+)
+
+add_polygon_layer(
+    m,
+    spatial_layers["history_other"],
+    "과거 침수흔적도",
+    color="#475569",
+    fill_color="#94a3b8",
+    fill_opacity=0.12,
+    weight=1.1,
+    show=show_history_other,
+    dash_array="2",
 )
 
 add_ai_prediction_layer(m, ai_predictions, show_ai_layer)
@@ -1186,6 +1206,7 @@ legend_html = f"""
     <div style="height:1px;background:#e2e8f0;margin:9px 0 7px;"></div>
     <div><span style="display:inline-block;width:18px;height:10px;background:#facc15;border:1px solid #d97706;margin-right:6px;"></span>2022 침수흔적도</div>
     <div><span style="display:inline-block;width:18px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
+    <div><span style="display:inline-block;width:18px;height:10px;background:#94a3b8;border:1px solid #475569;margin-right:6px;"></span>과거 침수흔적도</div>
 </div>
 """
 m.get_root().html.add_child(folium.Element(legend_html))
@@ -1206,7 +1227,8 @@ st.markdown(
 
 map_key = (
     f"rainguard_map_{rainfall}_{show_expected}_"
-    f"{show_history_2022}_{show_history_2023}_{show_ai_layer}_{expected_stage_label}"
+    f"{show_history_2022}_{show_history_2023}_{show_history_other}_"
+    f"{show_ai_layer}_{expected_stage_label}"
 )
 st_folium(m, width=1240, height=620, key=map_key)
 
