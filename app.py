@@ -26,6 +26,11 @@ except ImportError:
     joblib = None
 
 try:
+    from sklearn.neighbors import BallTree
+except ImportError:
+    BallTree = None
+
+try:
     import networkx as nx
     import osmnx as ox
 except ImportError:
@@ -713,6 +718,26 @@ def get_temporary_route_score(rainfall, mode):
     return base_score
 
 
+def get_rainfall_alpha(rainfall):
+    return {
+        "10mm/h": 1.2,
+        "30mm/h": 2.0,
+        "50mm/h": 3.0,
+    }.get(rainfall, 2.0)
+
+
+def classify_edge_risk(probability):
+    if probability >= 0.95:
+        return "통행 불가 후보"
+    if probability >= 0.85:
+        return "회피 우선"
+    if probability >= 0.68:
+        return "고위험"
+    if probability >= 0.50:
+        return "주의"
+    return "낮음"
+
+
 def get_route_risk_points(prediction_df):
     required = {"latitude", "longitude", "ai_risk_probability"}
     if prediction_df.empty or not required.issubset(prediction_df.columns):
@@ -724,9 +749,29 @@ def get_route_risk_points(prediction_df):
     ]
 
 
-def nearest_risk_probability(lat, lon, risk_points):
+def build_route_risk_lookup(risk_points):
     if not risk_points:
+        return {}
+    if BallTree is None:
+        return {"points": risk_points}
+    coordinates = [
+        [math.radians(point[0]), math.radians(point[1])]
+        for point in risk_points
+    ]
+    return {
+        "tree": BallTree(coordinates, metric="haversine"),
+        "risks": [point[2] for point in risk_points],
+        "points": risk_points,
+    }
+
+
+def nearest_risk_probability(lat, lon, risk_lookup):
+    if not risk_lookup:
         return 0.0
+    if risk_lookup.get("tree") is not None:
+        _, indexes = risk_lookup["tree"].query([[math.radians(lat), math.radians(lon)]], k=1)
+        return risk_lookup["risks"][int(indexes[0][0])]
+    risk_points = risk_lookup.get("points", [])
     nearest = min(
         risk_points,
         key=lambda point: (point[0] - lat) ** 2 + (point[1] - lon) ** 2,
@@ -742,50 +787,174 @@ def edge_length_m(graph, u, v, data):
     return calculate_distance_km(start, end) * 1000
 
 
-def best_edge_data(graph, u, v):
+def best_edge_data(graph, u, v, weight_key="length"):
     edge_data = graph.get_edge_data(u, v, default={})
     if not edge_data:
         return {}
     if all(isinstance(value, dict) for value in edge_data.values()):
-        return min(edge_data.values(), key=lambda item: float(item.get("length", 0) or 0))
+        return min(
+            edge_data.values(),
+            key=lambda item: float(item.get(weight_key, item.get("length", 0)) or 0),
+        )
     return edge_data
 
 
-def edge_midpoint(graph, u, v, data):
+def sample_edge_points(graph, u, v, data):
     geometry = data.get("geometry") if data else None
+    length = edge_length_m(graph, u, v, data)
     if geometry is not None and hasattr(geometry, "interpolate"):
-        point = geometry.interpolate(0.5, normalized=True)
-        return float(point.y), float(point.x)
+        sample_count = 3
+        if length > 900:
+            sample_count = 5
+        return [
+            (float(point.y), float(point.x))
+            for point in (
+                geometry.interpolate(index / (sample_count - 1), normalized=True)
+                for index in range(sample_count)
+            )
+        ]
+
     start_lat = float(graph.nodes[u]["y"])
     start_lon = float(graph.nodes[u]["x"])
     end_lat = float(graph.nodes[v]["y"])
     end_lon = float(graph.nodes[v]["x"])
-    return (start_lat + end_lat) / 2, (start_lon + end_lon) / 2
+    return [
+        (start_lat, start_lon),
+        ((start_lat + end_lat) / 2, (start_lon + end_lon) / 2),
+        (end_lat, end_lon),
+    ]
+
+
+def calculate_edge_risk(edge_geometry, ai_grid):
+    if not edge_geometry or not ai_grid:
+        return {
+            "risk": 0.0,
+            "avg_risk": 0.0,
+            "max_risk": 0.0,
+            "risk_class": "낮음",
+        }
+
+    risks = [
+        nearest_risk_probability(lat, lon, ai_grid)
+        for lat, lon in edge_geometry
+    ]
+    avg_risk = sum(risks) / len(risks)
+    max_risk = max(risks)
+    edge_risk = (0.6 * max_risk) + (0.4 * avg_risk)
+    return {
+        "risk": edge_risk,
+        "avg_risk": avg_risk,
+        "max_risk": max_risk,
+        "risk_class": classify_edge_risk(edge_risk),
+    }
+
+
+def calculate_safe_edge_cost(length, risk, rainfall):
+    alpha = get_rainfall_alpha(rainfall)
+    if risk >= 0.95:
+        return length * 500
+    if risk >= 0.85:
+        tier_multiplier = 16.0
+    elif risk >= 0.68:
+        tier_multiplier = 8.0
+    elif risk >= 0.50:
+        tier_multiplier = 3.0
+    else:
+        tier_multiplier = 0.35
+    return length * (1 + alpha * risk * tier_multiplier)
+
+
+def iter_graph_edges(graph):
+    if graph.is_multigraph():
+        yield from graph.edges(keys=True, data=True)
+        return
+    for u, v, data in graph.edges(data=True):
+        yield u, v, None, data
+
+
+def get_route_corridor_margin(rainfall, multiplier=1.0):
+    base_margin = {
+        "10mm/h": 0.005,
+        "30mm/h": 0.008,
+        "50mm/h": 0.011,
+    }.get(rainfall, 0.008)
+    return base_margin * multiplier
+
+
+def build_route_corridor_graph(graph, route_nodes, rainfall, multiplier=1.0):
+    if not route_nodes:
+        return graph
+    lats = [float(graph.nodes[node]["y"]) for node in route_nodes]
+    lons = [float(graph.nodes[node]["x"]) for node in route_nodes]
+    margin = get_route_corridor_margin(rainfall, multiplier)
+    min_lat, max_lat = min(lats) - margin, max(lats) + margin
+    min_lon, max_lon = min(lons) - margin, max(lons) + margin
+    route_node_set = set(route_nodes)
+    candidate_nodes = [
+        node
+        for node, attrs in graph.nodes(data=True)
+        if (
+            node in route_node_set
+            or (
+                min_lat <= float(attrs.get("y", 0)) <= max_lat
+                and min_lon <= float(attrs.get("x", 0)) <= max_lon
+            )
+        )
+    ]
+    if len(candidate_nodes) < len(route_nodes):
+        return graph
+    return graph.subgraph(candidate_nodes).copy()
 
 
 def apply_safe_edge_weights(graph, risk_points, rainfall):
-    alpha_by_rainfall = {
-        "10mm/h": 1.2,
-        "30mm/h": 2.2,
-        "50mm/h": 3.2,
-    }
-    alpha = alpha_by_rainfall.get(rainfall, 2.2)
-    for u, v, _key, data in graph.edges(keys=True, data=True):
-        mid_lat, mid_lon = edge_midpoint(graph, u, v, data)
-        risk_probability = nearest_risk_probability(mid_lat, mid_lon, risk_points)
+    risk_signature = (
+        rainfall,
+        len(risk_points),
+        round(sum(point[2] for point in risk_points), 4),
+    )
+    if graph.graph.get("safe_weight_signature") == risk_signature:
+        return
+
+    risk_lookup = build_route_risk_lookup(risk_points)
+    for u, v, _key, data in iter_graph_edges(graph):
         length = edge_length_m(graph, u, v, data)
-        data["route_risk_probability"] = risk_probability
-        data["safe_length"] = length * (1 + alpha * risk_probability)
+        risk_data = calculate_edge_risk(sample_edge_points(graph, u, v, data), risk_lookup)
+        data["route_risk_probability"] = risk_data["risk"]
+        data["route_avg_risk_probability"] = risk_data["avg_risk"]
+        data["route_max_risk_probability"] = risk_data["max_risk"]
+        data["route_risk_class"] = risk_data["risk_class"]
+        data["route_blocked_candidate"] = risk_data["max_risk"] >= 0.95
+        data["safe_length"] = calculate_safe_edge_cost(length, risk_data["risk"], rainfall)
+
+    graph.graph["safe_weight_signature"] = risk_signature
 
 
-def route_to_coordinates(graph, route_nodes):
+def apply_risk_to_route_edges(graph, route_nodes, risk_points, rainfall):
+    if not route_nodes or not risk_points:
+        return
+    risk_lookup = build_route_risk_lookup(risk_points)
+    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        data = best_edge_data(graph, u, v, "length")
+        if not data:
+            continue
+        length = edge_length_m(graph, u, v, data)
+        risk_data = calculate_edge_risk(sample_edge_points(graph, u, v, data), risk_lookup)
+        data["route_risk_probability"] = risk_data["risk"]
+        data["route_avg_risk_probability"] = risk_data["avg_risk"]
+        data["route_max_risk_probability"] = risk_data["max_risk"]
+        data["route_risk_class"] = risk_data["risk_class"]
+        data["route_blocked_candidate"] = risk_data["max_risk"] >= 0.95
+        data["safe_length"] = calculate_safe_edge_cost(length, risk_data["risk"], rainfall)
+
+
+def route_to_coordinates(graph, route_nodes, weight_key="length"):
     coordinates = []
     if len(route_nodes) == 1:
         node = graph.nodes[route_nodes[0]]
         return [[float(node["y"]), float(node["x"])]]
 
     for u, v in zip(route_nodes[:-1], route_nodes[1:]):
-        data = best_edge_data(graph, u, v)
+        data = best_edge_data(graph, u, v, weight_key)
         geometry = data.get("geometry") if data else None
         if geometry is not None and hasattr(geometry, "coords"):
             segment = [[float(lat), float(lon)] for lon, lat in geometry.coords]
@@ -803,81 +972,266 @@ def route_to_coordinates(graph, route_nodes):
     return coordinates
 
 
-def route_length_km(graph, route_nodes):
-    total_m = 0.0
+def collect_route_edges(graph, route_nodes, weight_key):
+    route_edges = []
     for u, v in zip(route_nodes[:-1], route_nodes[1:]):
-        data = best_edge_data(graph, u, v)
-        total_m += edge_length_m(graph, u, v, data)
-    return round(total_m / 1000, 2)
+        data = best_edge_data(graph, u, v, weight_key)
+        length = edge_length_m(graph, u, v, data)
+        risk = float(data.get("route_risk_probability", 0) or 0)
+        avg_risk = float(data.get("route_avg_risk_probability", risk) or risk)
+        max_risk = float(data.get("route_max_risk_probability", risk) or risk)
+        route_edges.append(
+            {
+                "length_m": length,
+                "risk": risk,
+                "avg_risk": avg_risk,
+                "max_risk": max_risk,
+                "risk_class": data.get("route_risk_class", classify_edge_risk(risk)),
+                "blocked_candidate": bool(data.get("route_blocked_candidate", False)),
+                "cost": float(data.get(weight_key, length) or length),
+            }
+        )
+    return route_edges
 
 
-def route_average_risk(graph, route_nodes):
-    risks = []
-    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
-        data = best_edge_data(graph, u, v)
-        if data and data.get("route_risk_probability") is not None:
-            risks.append(float(data["route_risk_probability"]))
-    if not risks:
-        return None
-    return sum(risks) / len(risks)
+def summarize_route(route_edges, rainfall=None, mode="최단경로", fallback_distance_km=0):
+    if not route_edges:
+        return {
+            "distance_km": round(fallback_distance_km, 2),
+            "avg_risk": 0.0,
+            "max_risk": 0.0,
+            "high_risk_count": 0,
+            "high_risk_km": 0.0,
+            "blocked_count": 0,
+            "cost_score": round(fallback_distance_km, 1),
+            "risk_score": get_temporary_route_score(rainfall, mode) if rainfall else 0,
+        }
 
-
-def get_route_score(rainfall, mode, average_risk=None):
-    if average_risk is None:
-        return get_temporary_route_score(rainfall, mode)
-    base_score = get_temporary_route_score(rainfall, "최단경로")
-    score = round(base_score * 0.55 + average_risk * 100 * 0.45)
-    if mode == "안전경로":
-        score = max(score - 8, 0)
-    return min(score, 100)
-
-
-def calculate_route_result(start_point, end_point, mode, rainfall, ai_predictions):
-    fallback = {
-        "coordinates": [[start_point["lat"], start_point["lon"]], [end_point["lat"], end_point["lon"]]],
-        "distance_km": calculate_distance_km(start_point, end_point),
-        "score": get_temporary_route_score(rainfall, mode),
-        "route_type": "직선 연결",
-        "is_network_route": False,
+    total_m = sum(edge["length_m"] for edge in route_edges)
+    total_cost = sum(edge["cost"] for edge in route_edges)
+    if total_m <= 0:
+        avg_risk = 0.0
+    else:
+        avg_risk = sum(edge["risk"] * edge["length_m"] for edge in route_edges) / total_m
+    max_risk = max(edge["max_risk"] for edge in route_edges)
+    high_edges = [edge for edge in route_edges if edge["risk"] >= 0.68 or edge["max_risk"] >= 0.85]
+    blocked_edges = [edge for edge in route_edges if edge["blocked_candidate"] or edge["max_risk"] >= 0.95]
+    base_score = get_temporary_route_score(rainfall, "최단경로") if rainfall else 50
+    risk_score = round(
+        min(
+            100,
+            (base_score * 0.25)
+            + (avg_risk * 100 * 0.45)
+            + (max_risk * 100 * 0.25)
+            + (len(high_edges) * 1.4)
+            + (len(blocked_edges) * 8),
+        )
+    )
+    return {
+        "distance_km": round(total_m / 1000, 2),
+        "avg_risk": avg_risk,
+        "max_risk": max_risk,
+        "high_risk_count": len(high_edges),
+        "high_risk_km": round(sum(edge["length_m"] for edge in high_edges) / 1000, 2),
+        "blocked_count": len(blocked_edges),
+        "cost_score": round(total_cost / 1000, 1),
+        "risk_score": risk_score,
     }
+
+
+def fallback_route_result(start_point, end_point, mode, rainfall, reason):
+    distance_km = calculate_distance_km(start_point, end_point)
+    summary = summarize_route([], rainfall, mode, distance_km)
+    return {
+        "coordinates": [[start_point["lat"], start_point["lon"]], [end_point["lat"], end_point["lon"]]],
+        "distance_km": distance_km,
+        "score": summary["risk_score"],
+        "route_type": reason,
+        "is_network_route": False,
+        "summary": summary,
+        "start_point": start_point,
+        "end_point": end_point,
+    }
+
+
+def build_route_result(graph, route_nodes, weight_key, mode, rainfall, route_type, start_point, end_point):
+    coordinates = route_to_coordinates(graph, route_nodes, weight_key)
+    route_edges = collect_route_edges(graph, route_nodes, weight_key)
+    summary = summarize_route(route_edges, rainfall, mode)
+    return {
+        "coordinates": coordinates,
+        "distance_km": summary["distance_km"],
+        "score": summary["risk_score"],
+        "route_type": route_type,
+        "is_network_route": True,
+        "route_edges": route_edges,
+        "summary": summary,
+        "start_point": start_point,
+        "end_point": end_point,
+    }
+
+
+def build_route_warnings(shortest_route, safe_route):
+    warnings = []
+    shortest_summary = shortest_route["summary"]
+    safe_summary = safe_route["summary"]
+
+    if shortest_summary["max_risk"] >= 0.95:
+        warnings.append("최단경로에 매우 위험한 침수 구간이 포함되어 있습니다.")
+    elif shortest_summary["max_risk"] >= 0.85:
+        warnings.append("최단경로에 고위험 침수 구간이 포함되어 있습니다.")
+
+    if safe_summary["max_risk"] >= 0.95:
+        warnings.append("안전경로도 매우 위험한 구간을 완전히 피하지 못했습니다.")
+    elif safe_summary["max_risk"] >= 0.85:
+        warnings.append("안전경로에 일부 고위험 구간이 남아 있습니다.")
+
+    if (
+        shortest_summary["high_risk_count"] > 0
+        and safe_summary["high_risk_count"] >= shortest_summary["high_risk_count"]
+    ):
+        warnings.append("대체 가능한 안전 도로가 부족해 일부 위험 구간이 포함되었습니다.")
+
+    return warnings
+
+
+def build_route_improvement_text(shortest_route, safe_route):
+    shortest_summary = shortest_route["summary"]
+    safe_summary = safe_route["summary"]
+    distance_delta = safe_summary["distance_km"] - shortest_summary["distance_km"]
+    risk_delta = (shortest_summary["avg_risk"] - safe_summary["avg_risk"]) * 100
+
+    if risk_delta > 0.5:
+        return (
+            f"안전경로는 거리가 {distance_delta:+.2f}km 변하지만, "
+            f"평균 위험도를 {risk_delta:.1f}%p 낮춥니다."
+        )
+    return "두 경로의 평균 위험도 차이가 크지 않습니다."
+
+
+def calculate_route_results(start_point, end_point, mode, rainfall, ai_predictions, need_safe_route=True):
+    straight_shortest = fallback_route_result(start_point, end_point, "최단경로", rainfall, "직선 연결")
+    straight_safe = fallback_route_result(start_point, end_point, "안전경로", rainfall, "직선 연결")
+
+    if start_point["name"] == end_point["name"]:
+        warning = "출발지와 도착지가 같아 경로 비교를 생략했습니다."
+        return {
+            "shortest": straight_shortest,
+            "safe": straight_safe,
+            "selected": straight_safe if mode == "안전경로" else straight_shortest,
+            "warnings": [warning],
+            "improvement_text": "출발지와 도착지가 같습니다.",
+        }
 
     graph = load_road_graph(build_road_graph_signature())
     if graph is None:
-        return fallback
+        warning = "도로망 데이터를 불러오지 못해 직선 연결로 표시합니다."
+        return {
+            "shortest": straight_shortest,
+            "safe": straight_safe,
+            "selected": straight_safe if mode == "안전경로" else straight_shortest,
+            "warnings": [warning],
+            "improvement_text": "도로망 데이터가 없어 안전경로 비교를 계산하지 못했습니다.",
+        }
 
     try:
         origin_node = ox.distance.nearest_nodes(graph, X=start_point["lon"], Y=start_point["lat"])
         destination_node = ox.distance.nearest_nodes(graph, X=end_point["lon"], Y=end_point["lat"])
         risk_points = get_route_risk_points(ai_predictions)
-        weight = "length"
-        route_type = "OSM 최단경로"
+        warnings = []
+        if not risk_points:
+            warnings.append("AI 위험 격자가 없어 안전경로는 최단경로 기준으로 표시됩니다.")
 
-        if mode == "안전경로" and risk_points:
-            apply_safe_edge_weights(graph, risk_points, rainfall)
-            weight = "safe_length"
-            route_type = "AI 위험 반영 경로"
+        shortest_nodes = nx.shortest_path(graph, origin_node, destination_node, weight="length")
+        if risk_points and need_safe_route:
+            apply_risk_to_route_edges(graph, shortest_nodes, risk_points, rainfall)
+        shortest_route = build_route_result(
+            graph,
+            shortest_nodes,
+            "length",
+            "최단경로",
+            rainfall,
+            "OSM 최단경로",
+            start_point,
+            end_point,
+        )
 
-        route_nodes = nx.shortest_path(graph, origin_node, destination_node, weight=weight)
-        coordinates = route_to_coordinates(graph, route_nodes)
-        if len(coordinates) < 2:
-            return fallback
+        if risk_points and need_safe_route:
+            try:
+                safe_graph = build_route_corridor_graph(graph, shortest_nodes, rainfall)
+                apply_safe_edge_weights(safe_graph, risk_points, rainfall)
+                safe_nodes = nx.shortest_path(safe_graph, origin_node, destination_node, weight="safe_length")
+                safe_route = build_route_result(
+                    safe_graph,
+                    safe_nodes,
+                    "safe_length",
+                    "안전경로",
+                    rainfall,
+                    "AI 위험 회피 경로",
+                    start_point,
+                    end_point,
+                )
+            except Exception:
+                try:
+                    safe_graph = build_route_corridor_graph(graph, shortest_nodes, rainfall, multiplier=1.8)
+                    apply_safe_edge_weights(safe_graph, risk_points, rainfall)
+                    safe_nodes = nx.shortest_path(safe_graph, origin_node, destination_node, weight="safe_length")
+                    safe_route = build_route_result(
+                        safe_graph,
+                        safe_nodes,
+                        "safe_length",
+                        "안전경로",
+                        rainfall,
+                        "AI 위험 회피 경로",
+                        start_point,
+                        end_point,
+                    )
+                    warnings.append("일부 구간은 더 넓은 후보 구역에서 우회 경로를 계산했습니다.")
+                except Exception:
+                    safe_route = build_route_result(
+                        graph,
+                        shortest_nodes,
+                        "length",
+                        "안전경로",
+                        rainfall,
+                        "안전경로 fallback",
+                        start_point,
+                        end_point,
+                    )
+                    warnings.append("안전경로 계산에 실패해 최단경로를 대신 표시합니다.")
+        else:
+            safe_route = build_route_result(
+                graph,
+                shortest_nodes,
+                "length",
+                "안전경로",
+                rainfall,
+                "비교 대기",
+                start_point,
+                end_point,
+            )
 
-        average_risk = route_average_risk(graph, route_nodes)
+        warnings.extend(build_route_warnings(shortest_route, safe_route))
+        selected = safe_route if mode == "안전경로" else shortest_route
         return {
-            "coordinates": coordinates,
-            "distance_km": route_length_km(graph, route_nodes),
-            "score": get_route_score(rainfall, mode, average_risk),
-            "route_type": route_type,
-            "is_network_route": True,
+            "shortest": shortest_route,
+            "safe": safe_route,
+            "selected": selected,
+            "warnings": warnings,
+            "improvement_text": build_route_improvement_text(shortest_route, safe_route),
         }
     except Exception:
-        return fallback
+        warning = "경로 계산 중 오류가 발생해 직선 연결로 표시합니다."
+        return {
+            "shortest": straight_shortest,
+            "safe": straight_safe,
+            "selected": straight_safe if mode == "안전경로" else straight_shortest,
+            "warnings": [warning],
+            "improvement_text": "경로 계산에 실패했습니다.",
+        }
 
 
-def add_route_layer(map_obj, start_point, end_point, mode, route_result):
-    route_color = "#2563eb" if mode == "최단경로" else "#7c3aed"
-    route_tooltip = "최단경로 후보" if mode == "최단경로" else "안전경로 후보"
-
+def add_route_markers(map_obj, start_point, end_point):
     folium.Marker(
         location=[start_point["lat"], start_point["lon"]],
         tooltip=f"출발지: {start_point['name']}",
@@ -892,36 +1246,127 @@ def add_route_layer(map_obj, start_point, end_point, mode, route_result):
         icon=folium.Icon(color="red", icon="stop"),
     ).add_to(map_obj)
 
+
+def draw_route_line(map_obj, route_result, color, weight, opacity, tooltip, dash_array=None):
+    if not route_result or len(route_result.get("coordinates", [])) < 2:
+        return
     folium.PolyLine(
         locations=route_result["coordinates"],
-        color=route_color,
-        weight=5,
-        opacity=0.86,
-        tooltip=route_tooltip,
+        color=color,
+        weight=weight,
+        opacity=opacity,
+        tooltip=tooltip,
+        dash_array=dash_array,
     ).add_to(map_obj)
 
 
-def render_route_summary_card(start_name, end_name, mode, distance_km, rainfall, score, route_type):
-    score_color = "#16a34a"
+def add_comparison_routes_to_map(map_obj, shortest_route, safe_route, selected_mode, show_comparison):
+    start_point = shortest_route["start_point"]
+    end_point = shortest_route["end_point"]
+    add_route_markers(map_obj, start_point, end_point)
+
+    if show_comparison:
+        draw_route_line(
+            map_obj,
+            shortest_route,
+            "#2563eb",
+            4,
+            0.72,
+            "최단경로",
+            "6",
+        )
+        draw_route_line(
+            map_obj,
+            safe_route,
+            "#7c3aed",
+            6,
+            0.9,
+            "안전경로",
+        )
+        return
+
+    selected_route = safe_route if selected_mode == "안전경로" else shortest_route
+    draw_route_line(
+        map_obj,
+        selected_route,
+        "#7c3aed" if selected_mode == "안전경로" else "#2563eb",
+        6 if selected_mode == "안전경로" else 5,
+        0.88,
+        selected_mode,
+    )
+
+
+def route_score_color(score):
     if score >= 75:
-        score_color = "#dc2626"
-    elif score >= 50:
-        score_color = "#d97706"
+        return "#dc2626"
+    if score >= 50:
+        return "#d97706"
+    return "#16a34a"
+
+
+def risk_percent_text(value):
+    return f"{value * 100:.1f}%"
+
+
+def render_route_comparison(shortest_summary, safe_summary, warnings, improvement_text):
+    avoided_high_count = max(0, shortest_summary["high_risk_count"] - safe_summary["high_risk_count"])
+    warning_html = "".join(f"<div class='route-warning'>{message}</div>" for message in warnings[:3])
+    if not warning_html:
+        warning_html = "<div class='route-ok'>고위험 경고 없음</div>"
+
+    def route_column(title, summary, accent_color, avoided_text="-"):
+        score_color = route_score_color(summary["risk_score"])
+        return f"""<div class="route-column">
+<div class="route-column-title" style="color:{accent_color};">{title}</div>
+<div><span>거리</span><b>{summary['distance_km']:.2f} km</b></div>
+<div><span>위험 점수</span><b style="color:{score_color};">{summary['risk_score']}점</b></div>
+<div><span>평균 위험도</span><b>{risk_percent_text(summary['avg_risk'])}</b></div>
+<div><span>최대 위험도</span><b>{risk_percent_text(summary['max_risk'])}</b></div>
+<div><span>고위험 구간</span><b>{summary['high_risk_count']}개 · {summary['high_risk_km']:.2f} km</b></div>
+<div><span>회피 구간</span><b>{avoided_text}</b></div>
+<div><span>비용 점수</span><b>{summary['cost_score']:.1f}</b></div>
+</div>"""
+
+    shortest_column = route_column("최단경로", shortest_summary, "#2563eb")
+    safe_column = route_column("안전경로", safe_summary, "#7c3aed", f"{avoided_high_count}개")
 
     st.markdown(
         f"""
 <div class="route-card">
     <div class="section-head route-head">
+        <h3>Route Compare</h3>
+        <span>AI risk weighted</span>
+    </div>
+    <div class="route-explain">
+        안전경로는 AI 침수 위험 확률을 도로 비용에 반영해 고위험 구간을 우회하도록 계산됩니다.
+    </div>
+    <div class="route-compare-grid">
+{shortest_column}
+{safe_column}
+    </div>
+    <div class="route-summary-line">{improvement_text}</div>
+    <div class="route-warning-list">{warning_html}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_route_selected_card(route_result, mode, rainfall):
+    summary = route_result["summary"]
+    score_color = route_score_color(summary["risk_score"])
+    st.markdown(
+        f"""
+<div class="route-card">
+    <div class="section-head route-head">
         <h3>Route Preview</h3>
-        <span>{route_type}</span>
+        <span>{route_result['route_type']}</span>
     </div>
     <div class="route-grid">
-        <div><span>출발지</span><b>{start_name}</b></div>
-        <div><span>도착지</span><b>{end_name}</b></div>
         <div><span>기준</span><b>{mode}</b></div>
-        <div><span>직선거리</span><b>{distance_km:.2f} km</b></div>
+        <div><span>거리</span><b>{summary['distance_km']:.2f} km</b></div>
+        <div><span>위험 점수</span><b style="color:{score_color}">{summary['risk_score']}점</b></div>
         <div><span>강수량</span><b>{rainfall}</b></div>
-        <div><span>임시 위험도</span><b style="color:{score_color}">{score}점</b></div>
     </div>
 </div>
 """,
@@ -1288,6 +1733,87 @@ st.markdown(
         font-weight: 950;
     }
 
+    .route-explain {
+        margin-bottom: 12px;
+        color: #475569;
+        font-size: 13px;
+        line-height: 1.5;
+    }
+
+    .route-compare-grid {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+    }
+
+    .route-column {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 8px;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 12px;
+        background: #f8fafc;
+    }
+
+    .route-column-title {
+        grid-column: 1 / -1;
+        font-size: 15px;
+        font-weight: 950;
+    }
+
+    .route-column span {
+        display: block;
+        color: #64748b;
+        font-size: 11px;
+        font-weight: 800;
+        margin-bottom: 4px;
+    }
+
+    .route-column b {
+        display: block;
+        color: #172033;
+        font-size: 15px;
+        line-height: 1.2;
+        font-weight: 950;
+    }
+
+    .route-summary-line {
+        margin-top: 12px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        background: #eef6ff;
+        color: #075985;
+        font-size: 13px;
+        font-weight: 850;
+    }
+
+    .route-warning-list {
+        display: grid;
+        gap: 6px;
+        margin-top: 10px;
+    }
+
+    .route-warning,
+    .route-ok {
+        border-radius: 8px;
+        padding: 8px 10px;
+        font-size: 12px;
+        font-weight: 850;
+    }
+
+    .route-warning {
+        background: #fff7ed;
+        color: #9a3412;
+        border: 1px solid #fed7aa;
+    }
+
+    .route-ok {
+        background: #ecfdf5;
+        color: #047857;
+        border: 1px solid #bbf7d0;
+    }
+
     .section-head {
         display: flex;
         justify-content: space-between;
@@ -1354,6 +1880,11 @@ st.markdown(
         .route-grid {
             grid-template-columns: 1fr 1fr;
         }
+
+        .route-compare-grid,
+        .route-column {
+            grid-template-columns: 1fr;
+        }
     }
 </style>
 """,
@@ -1379,6 +1910,7 @@ mode = st.sidebar.radio(
     "경로 추천 기준",
     ["최단경로", "안전경로"],
 )
+show_route_comparison = st.sidebar.checkbox("두 경로 비교 표시", value=False)
 
 route_points = get_route_points()
 route_point_names = list(route_points)
@@ -1417,7 +1949,8 @@ base_map_style = st.sidebar.selectbox(
 )
 
 risk = RISK_BY_RAINFALL[rainfall]
-if show_ai_layer:
+route_needs_ai = mode == "안전경로" or show_route_comparison
+if show_ai_layer or route_needs_ai:
     ai_predictions, ai_summary = get_ai_predictions(rainfall)
 else:
     ai_predictions = pd.DataFrame()
@@ -1433,7 +1966,15 @@ ai_avg_text = format_percent(ai_summary["avg_probability"], 1)
 ai_recall_text = format_percent(ai_summary["recall"], 1)
 ai_cells_text = f"{ai_summary['risk_cell_count']:,}개" if ai_summary["ready"] else "-"
 ai_color = ai_risk_color(ai_summary["avg_probability"] or 0)
-route_result = calculate_route_result(start_point, end_point, mode, rainfall, ai_predictions)
+route_results = calculate_route_results(
+    start_point,
+    end_point,
+    mode,
+    rainfall,
+    ai_predictions,
+    need_safe_route=route_needs_ai,
+)
+route_result = route_results["selected"]
 
 max_expected_stage = EXPECTED_STAGE_BY_RAINFALL[rainfall]
 spatial_layer_requested = show_expected or show_history_2022 or show_history_2023 or show_history_other
@@ -1595,7 +2136,13 @@ add_polygon_layer(
 )
 
 add_ai_prediction_layer(m, ai_predictions, show_ai_layer)
-add_route_layer(m, start_point, end_point, mode, route_result)
+add_comparison_routes_to_map(
+    m,
+    route_results["shortest"],
+    route_results["safe"],
+    mode,
+    show_route_comparison,
+)
 
 folium.Marker(
     location=analysis_center,
@@ -1663,18 +2210,19 @@ st.markdown(
 map_key = (
     f"rainguard_map_stable_{base_map_style}_{rainfall}_{show_expected}_"
     f"{show_history_2022}_{show_history_2023}_{show_history_other}_"
-    f"{show_ai_layer}_{expected_stage_label}_{mode}_{start_name}_{end_name}"
+    f"{show_ai_layer}_{expected_stage_label}_{mode}_{start_name}_{end_name}_"
+    f"{show_route_comparison}_safe_v2"
 )
 st_folium(m, width=1240, height=620, key=map_key, returned_objects=[])
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-render_route_summary_card(
-    start_name,
-    end_name,
-    mode,
-    route_result["distance_km"],
-    rainfall,
-    route_result["score"],
-    route_result["route_type"],
-)
+if show_route_comparison or mode == "안전경로":
+    render_route_comparison(
+        route_results["shortest"]["summary"],
+        route_results["safe"]["summary"],
+        route_results["warnings"],
+        route_results["improvement_text"],
+    )
+else:
+    render_route_selected_card(route_result, mode, rainfall)
