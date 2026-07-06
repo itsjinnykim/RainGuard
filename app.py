@@ -1,5 +1,6 @@
 import streamlit as st
 import folium
+import json
 import pandas as pd
 import re
 import warnings
@@ -35,6 +36,7 @@ DATA_DIR = BASE_DIR / "data"
 FLOOD_EXPECTED_DIR = DATA_DIR / "flood_expected"
 FLOOD_HISTORY_DIR = DATA_DIR / "flood_history"
 FLOOD_DATASET_PATH = DATA_DIR / "processed" / "flood_dataset.csv"
+AI_GRID_PATH = DATA_DIR / "processed" / "flood_grid.geojson"
 MODEL_DIR = BASE_DIR / "models"
 MODEL_PATH = MODEL_DIR / "flood_random_forest.joblib"
 MODEL_METRICS_PATH = MODEL_DIR / "model_metrics.csv"
@@ -98,10 +100,10 @@ AI_RISK_STYLE = {
 }
 
 ANALYSIS_BOUNDS = {
-    "min_lon": 127.013,
+    "min_lon": 127.008,
     "min_lat": 37.456,
     "max_lon": 127.124,
-    "max_lat": 37.536,
+    "max_lat": 37.540,
 }
 
 RAIN_DROPS = "".join(
@@ -327,7 +329,7 @@ def load_spatial_layers(signature):
 
 
 def build_ai_signature():
-    paths = [FLOOD_DATASET_PATH, MODEL_PATH, MODEL_METRICS_PATH]
+    paths = [FLOOD_DATASET_PATH, AI_GRID_PATH, MODEL_PATH, MODEL_METRICS_PATH]
     return tuple(
         (str(path), path.stat().st_mtime, path.stat().st_size)
         for path in paths
@@ -340,6 +342,14 @@ def load_ai_dataset(signature):
     if not FLOOD_DATASET_PATH.exists():
         return pd.DataFrame()
     return pd.read_csv(FLOOD_DATASET_PATH)
+
+
+@st.cache_data(show_spinner=False)
+def load_ai_grid_geojson(signature):
+    if not AI_GRID_PATH.exists():
+        return None
+    with AI_GRID_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 @st.cache_resource(show_spinner=False)
@@ -466,6 +476,32 @@ def build_ai_grid_geojson(prediction_df):
     ].copy()
     if visible_df.empty:
         return None
+
+    signature = build_ai_signature()
+    grid_geojson = load_ai_grid_geojson(signature)
+    probability_by_grid = dict(zip(visible_df["grid_id"], visible_df["ai_risk_probability"]))
+
+    if grid_geojson and grid_geojson.get("features"):
+        features = []
+        for feature in grid_geojson["features"]:
+            grid_id = feature.get("properties", {}).get("grid_id")
+            probability = probability_by_grid.get(grid_id)
+            if probability is None:
+                continue
+
+            risk_feature = {
+                "type": "Feature",
+                "properties": {
+                    **feature.get("properties", {}),
+                    "probability": float(probability),
+                    "probability_text": f"{float(probability) * 100:.0f}%",
+                    "risk": ai_risk_grade(float(probability)),
+                },
+                "geometry": feature["geometry"],
+            }
+            features.append(risk_feature)
+
+        return {"type": "FeatureCollection", "features": features}
 
     lat_step = estimate_grid_step(prediction_df["latitude"], 0.0045)
     lon_step = estimate_grid_step(prediction_df["longitude"], 0.0057)

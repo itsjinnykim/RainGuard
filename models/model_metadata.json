@@ -14,8 +14,8 @@
     "history_polygon_count",
     "distance_to_flood_area_m"
   ],
-  "train_rows": 810,
-  "test_rows": 270,
+  "train_rows": 453,
+  "test_rows": 153,
   "test_size": 0.25,
   "random_state": 42,
   "model_type": "RandomForestClassifier"

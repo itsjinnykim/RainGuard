@@ -37,7 +37,7 @@ RAINFALL_SCENARIOS = {
     "50mm/h": {"rainfall_mm_h": 50, "max_expected_stage": 6, "risk_multiplier": 1.3},
 }
 
-# Approximate Gangnam-gu analysis extent used for the prototype grid.
+# Fallback extent used only when a boundary GeoJSON is not available.
 GANGNAM_BOUNDS_WGS84 = {
     "min_lon": 127.013,
     "min_lat": 37.456,
@@ -55,6 +55,16 @@ def parse_args() -> argparse.Namespace:
         "--output",
         default="data/processed/flood_dataset.csv",
         help="CSV path to write the generated dataset.",
+    )
+    parser.add_argument(
+        "--grid-output",
+        default="data/processed/flood_grid.geojson",
+        help="GeoJSON path to write the clipped grid geometries.",
+    )
+    parser.add_argument(
+        "--boundary",
+        default="data/boundary/gangnam_boundary.geojson",
+        help="Boundary GeoJSON used to clip the analysis grid.",
     )
     parser.add_argument(
         "--cell-size",
@@ -173,7 +183,23 @@ def read_history_layers(history_dir: Path, region_gu: str) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(pd.concat(frames, ignore_index=True), geometry="geometry", crs=TARGET_CRS)
 
 
-def make_analysis_area() -> gpd.GeoDataFrame:
+def make_analysis_area(boundary_path: Path) -> gpd.GeoDataFrame:
+    if boundary_path.exists():
+        boundary = gpd.read_file(boundary_path)
+        boundary = boundary[boundary.geometry.notna()].copy()
+        boundary = boundary[~boundary.geometry.is_empty].copy()
+        if not boundary.empty:
+            if boundary.crs is None:
+                boundary = boundary.set_crs(WGS84_CRS, allow_override=True)
+            boundary = boundary.to_crs(TARGET_CRS)
+            geom = union_geometry(boundary)
+            geom = geom.buffer(0)
+            return gpd.GeoDataFrame(
+                {"name": ["gangnam_boundary"]},
+                geometry=[geom],
+                crs=TARGET_CRS,
+            )
+
     geom = box(
         GANGNAM_BOUNDS_WGS84["min_lon"],
         GANGNAM_BOUNDS_WGS84["min_lat"],
@@ -192,17 +218,25 @@ def clip_to_area(gdf: gpd.GeoDataFrame, area: gpd.GeoDataFrame) -> gpd.GeoDataFr
 
 def make_grid(area: gpd.GeoDataFrame, cell_size: int) -> gpd.GeoDataFrame:
     minx, miny, maxx, maxy = area.total_bounds
+    area_geom = area.geometry.iloc[0]
     cells = []
     grid_ids = []
+    cell_areas = []
     idx = 1
     for x in np.arange(minx, maxx, cell_size):
         for y in np.arange(miny, maxy, cell_size):
             cell = box(x, y, min(x + cell_size, maxx), min(y + cell_size, maxy))
-            if cell.intersects(area.geometry.iloc[0]):
-                cells.append(cell)
+            clipped_cell = cell.intersection(area_geom)
+            if not clipped_cell.is_empty:
+                cells.append(clipped_cell)
+                cell_areas.append(round(clipped_cell.area, 1))
                 grid_ids.append(f"G{idx:04d}")
                 idx += 1
-    return gpd.GeoDataFrame({"grid_id": grid_ids}, geometry=cells, crs=TARGET_CRS)
+    return gpd.GeoDataFrame(
+        {"grid_id": grid_ids, "cell_area_m2": cell_areas},
+        geometry=cells,
+        crs=TARGET_CRS,
+    )
 
 
 def add_expected_features(grid: gpd.GeoDataFrame, expected: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -352,14 +386,23 @@ def expand_rainfall_scenarios(grid: gpd.GeoDataFrame) -> pd.DataFrame:
     return pd.concat(scenario_frames, ignore_index=True)[columns]
 
 
+def export_grid_geojson(grid: gpd.GeoDataFrame, output_path: Path) -> None:
+    grid_output = grid[["grid_id", "cell_area_m2", "geometry"]].copy()
+    grid_output = grid_output.to_crs(WGS84_CRS)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    grid_output.to_file(output_path, driver="GeoJSON")
+
+
 def main() -> None:
     args = parse_args()
     data_dir = Path(args.data_dir)
     expected_dir = data_dir / "flood_expected"
     history_dir = data_dir / "flood_history"
     output_path = Path(args.output)
+    grid_output_path = Path(args.grid_output)
+    boundary_path = Path(args.boundary)
 
-    analysis_area = make_analysis_area()
+    analysis_area = make_analysis_area(boundary_path)
     expected = clip_to_area(read_expected_layers(expected_dir), analysis_area)
     history = clip_to_area(read_history_layers(history_dir, args.region_gu), analysis_area)
 
@@ -371,8 +414,10 @@ def main() -> None:
     dataset = expand_rainfall_scenarios(grid)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     dataset.to_csv(output_path, index=False, encoding="utf-8-sig")
+    export_grid_geojson(grid, grid_output_path)
 
     print(f"Saved: {output_path}")
+    print(f"Saved grid: {grid_output_path}")
     print(f"Rows: {len(dataset):,}")
     print(f"Grid cells: {dataset['grid_id'].nunique():,}")
     print(f"Expected polygons in area: {len(expected):,}")
