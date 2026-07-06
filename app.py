@@ -264,13 +264,27 @@ def simplify_for_map(gdf):
     return mapped
 
 
-def build_data_signature():
-    shp_files = find_shp_files(FLOOD_EXPECTED_DIR) + find_shp_files(FLOOD_HISTORY_DIR)
+def build_data_signature(load_expected, load_history_2022, load_history_2023, load_history_other):
+    shp_files = []
+    if load_expected:
+        shp_files.extend(find_shp_files(FLOOD_EXPECTED_DIR))
+
+    if load_history_2022 or load_history_2023 or load_history_other:
+        history_files = find_shp_files(FLOOD_HISTORY_DIR)
+        if load_history_2022:
+            shp_files.extend(path for path in history_files if "2022" in path.name)
+        if load_history_2023:
+            shp_files.extend(path for path in history_files if "2023" in path.name)
+        if load_history_other:
+            shp_files.extend(
+                path for path in history_files if "2022" not in path.name and "2023" not in path.name
+            )
+
     return tuple((str(path), path.stat().st_mtime, path.stat().st_size) for path in shp_files)
 
 
 @st.cache_data(show_spinner=False)
-def load_spatial_layers(signature):
+def load_spatial_layers(signature, load_expected, load_history_2022, load_history_2023, load_history_other):
     if gpd is None:
         return {
             "expected_by_stage": {},
@@ -286,13 +300,19 @@ def load_spatial_layers(signature):
             "messages": ["GeoPandas가 설치되어 있지 않아 SHP 파일을 읽을 수 없음"],
         }
 
-    expected_files = find_shp_files(FLOOD_EXPECTED_DIR)
-    history_files = find_shp_files(FLOOD_HISTORY_DIR)
-    history_2022_files = [path for path in history_files if "2022" in path.name]
-    history_2023_files = [path for path in history_files if "2023" in path.name]
-    history_other_files = [
-        path for path in history_files if "2022" not in path.name and "2023" not in path.name
-    ]
+    expected_files = find_shp_files(FLOOD_EXPECTED_DIR) if load_expected else []
+    history_files = (
+        find_shp_files(FLOOD_HISTORY_DIR)
+        if load_history_2022 or load_history_2023 or load_history_other
+        else []
+    )
+    history_2022_files = [path for path in history_files if "2022" in path.name] if load_history_2022 else []
+    history_2023_files = [path for path in history_files if "2023" in path.name] if load_history_2023 else []
+    history_other_files = (
+        [path for path in history_files if "2022" not in path.name and "2023" not in path.name]
+        if load_history_other
+        else []
+    )
 
     expected_by_stage = {}
     expected_stage_counts = {}
@@ -316,11 +336,11 @@ def load_spatial_layers(signature):
     history_other, history_other_count, history_other_messages = combine_shp_files(history_other_files)
 
     messages = []
-    if not expected_files:
+    if load_expected and not expected_files:
         messages.append("data/flood_expected 폴더에서 .shp 파일을 찾지 못함")
-    if not history_2022_files:
+    if load_history_2022 and not history_2022_files:
         messages.append("data/flood_history 폴더에서 2022 .shp 파일을 찾지 못함")
-    if not history_2023_files:
+    if load_history_2023 and not history_2023_files:
         messages.append("data/flood_history 폴더에서 2023 .shp 파일을 찾지 못함")
 
     messages.extend(expected_messages)
@@ -341,6 +361,23 @@ def load_spatial_layers(signature):
             {"name": "과거 침수흔적도", "files": len(history_other_files), "features": history_other_count},
         ],
         "messages": messages,
+    }
+
+
+def empty_spatial_layers(message="선택된 SHP 레이어 없음"):
+    return {
+        "expected_by_stage": {},
+        "expected_stage_counts": {},
+        "history_2022": None,
+        "history_2023": None,
+        "history_other": None,
+        "summary": [
+            {"name": "침수예상도", "files": 0, "features": 0},
+            {"name": "2022 침수흔적도", "files": 0, "features": 0},
+            {"name": "2023 침수흔적도", "files": 0, "features": 0},
+            {"name": "과거 침수흔적도", "files": 0, "features": 0},
+        ],
+        "messages": [message] if message else [],
     }
 
 
@@ -557,6 +594,9 @@ def build_ai_grid_geojson(prediction_df):
 
 
 def add_ai_prediction_layer(map_obj, prediction_df, show):
+    if not show:
+        return
+
     grid_geojson = build_ai_grid_geojson(prediction_df)
     if grid_geojson is None:
         return
@@ -581,6 +621,9 @@ def add_ai_prediction_layer(map_obj, prediction_df, show):
 
 
 def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weight, show, dash_array=None):
+    if not show:
+        return
+
     if gdf is None or gdf.empty:
         return
 
@@ -1017,28 +1060,57 @@ show_history_2022 = st.sidebar.checkbox("2022 침수흔적도 표시", value=Fal
 show_history_2023 = st.sidebar.checkbox("2023 침수흔적도 표시", value=False)
 show_history_other = st.sidebar.checkbox("과거 침수흔적도 표시", value=False)
 show_ai_layer = st.sidebar.checkbox("AI 예측", value=True)
+base_map_style = st.sidebar.selectbox(
+    "지도 스타일",
+    ["CartoDB positron", "OpenStreetMap"],
+)
 
 risk = RISK_BY_RAINFALL[rainfall]
-ai_predictions, ai_summary = get_ai_predictions(rainfall)
+if show_ai_layer:
+    ai_predictions, ai_summary = get_ai_predictions(rainfall)
+else:
+    ai_predictions = pd.DataFrame()
+    ai_summary = {
+        "ready": False,
+        "avg_probability": None,
+        "risk_cell_count": 0,
+        "recall": None,
+        "f1_score": None,
+        "roc_auc": None,
+    }
 ai_avg_text = format_percent(ai_summary["avg_probability"], 1)
 ai_recall_text = format_percent(ai_summary["recall"], 1)
 ai_cells_text = f"{ai_summary['risk_cell_count']:,}개" if ai_summary["ready"] else "-"
 ai_color = ai_risk_color(ai_summary["avg_probability"] or 0)
 
-with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
-    spatial_layers = load_spatial_layers(build_data_signature())
-
 max_expected_stage = EXPECTED_STAGE_BY_RAINFALL[rainfall]
-visible_expected_stages = [
-    stage
-    for stage in sorted(spatial_layers["expected_by_stage"])
-    if stage <= max_expected_stage
-]
+spatial_layer_requested = show_expected or show_history_2022 or show_history_2023 or show_history_other
+if spatial_layer_requested:
+    with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
+        spatial_layers = load_spatial_layers(
+            build_data_signature(show_expected, show_history_2022, show_history_2023, show_history_other),
+            show_expected,
+            show_history_2022,
+            show_history_2023,
+            show_history_other,
+        )
+else:
+    spatial_layers = empty_spatial_layers()
+
+visible_expected_stages = (
+    [
+        stage
+        for stage in sorted(spatial_layers["expected_by_stage"])
+        if stage <= max_expected_stage
+    ]
+    if show_expected
+    else []
+)
 visible_expected_count = sum(
     spatial_layers["expected_stage_counts"].get(stage, 0)
     for stage in visible_expected_stages
 )
-expected_stage_label = f"1~{max_expected_stage}단계"
+expected_stage_label = f"1~{max_expected_stage}단계" if show_expected else "꺼짐"
 
 st.sidebar.markdown(
     f"""
@@ -1108,18 +1180,19 @@ analysis_center = [37.5172, 127.0473]
 m = folium.Map(
     location=analysis_center,
     zoom_start=13,
-    tiles="CartoDB positron",
+    tiles=base_map_style,
     prefer_canvas=True,
 )
 
-tile_tone_css = """
-<style>
-    .leaflet-tile-pane img {
-        filter: contrast(1.08) saturate(1.05) brightness(0.98);
-    }
-</style>
-"""
-m.get_root().header.add_child(folium.Element(tile_tone_css))
+if base_map_style == "CartoDB positron":
+    tile_tone_css = """
+    <style>
+        .leaflet-tile-pane img {
+            filter: contrast(1.08) saturate(1.05) brightness(0.98);
+        }
+    </style>
+    """
+    m.get_root().header.add_child(folium.Element(tile_tone_css))
 
 for stage in visible_expected_stages:
     style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
@@ -1235,10 +1308,10 @@ st.markdown(
 )
 
 map_key = (
-    f"rainguard_map_positron_soft_layers_{rainfall}_{show_expected}_"
+    f"rainguard_map_stable_{base_map_style}_{rainfall}_{show_expected}_"
     f"{show_history_2022}_{show_history_2023}_{show_history_other}_"
     f"{show_ai_layer}_{expected_stage_label}"
 )
-st_folium(m, width=1240, height=620, key=map_key)
+st_folium(m, width=1240, height=620, key=map_key, returned_objects=[])
 
 st.markdown("</div>", unsafe_allow_html=True)
