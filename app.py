@@ -1,6 +1,7 @@
 import streamlit as st
 import folium
 import json
+import math
 import pandas as pd
 import re
 import warnings
@@ -642,6 +643,106 @@ def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weigh
     ).add_to(map_obj)
 
 
+def get_route_points():
+    return {
+        "강남역": {"name": "강남역", "lat": 37.4979, "lon": 127.0276},
+        "역삼역": {"name": "역삼역", "lat": 37.5007, "lon": 127.0365},
+        "선릉역": {"name": "선릉역", "lat": 37.5045, "lon": 127.0490},
+        "삼성역": {"name": "삼성역", "lat": 37.5088, "lon": 127.0632},
+        "코엑스": {"name": "코엑스", "lat": 37.5118, "lon": 127.0592},
+        "강남구청역": {"name": "강남구청역", "lat": 37.5172, "lon": 127.0413},
+        "압구정로데오역": {"name": "압구정로데오역", "lat": 37.5275, "lon": 127.0406},
+        "대치역": {"name": "대치역", "lat": 37.4945, "lon": 127.0632},
+    }
+
+
+def calculate_distance_km(start, end):
+    earth_radius_km = 6371.0
+    start_lat = math.radians(start["lat"])
+    start_lon = math.radians(start["lon"])
+    end_lat = math.radians(end["lat"])
+    end_lon = math.radians(end["lon"])
+    d_lat = end_lat - start_lat
+    d_lon = end_lon - start_lon
+
+    a = (
+        math.sin(d_lat / 2) ** 2
+        + math.cos(start_lat) * math.cos(end_lat) * math.sin(d_lon / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return round(earth_radius_km * c, 2)
+
+
+def get_temporary_route_score(rainfall, mode):
+    base_scores = {
+        "10mm/h": 30,
+        "30mm/h": 60,
+        "50mm/h": 85,
+    }
+    base_score = base_scores.get(rainfall, 60)
+    if mode == "안전경로":
+        return max(base_score - 12, 0)
+    return base_score
+
+
+def add_route_layer(map_obj, start_point, end_point, mode):
+    route_color = "#2563eb" if mode == "최단경로" else "#7c3aed"
+    route_tooltip = "최단경로 후보" if mode == "최단경로" else "안전경로 후보"
+
+    folium.Marker(
+        location=[start_point["lat"], start_point["lon"]],
+        tooltip=f"출발지: {start_point['name']}",
+        popup=start_point["name"],
+        icon=folium.Icon(color="green", icon="play"),
+    ).add_to(map_obj)
+
+    folium.Marker(
+        location=[end_point["lat"], end_point["lon"]],
+        tooltip=f"도착지: {end_point['name']}",
+        popup=end_point["name"],
+        icon=folium.Icon(color="red", icon="stop"),
+    ).add_to(map_obj)
+
+    folium.PolyLine(
+        locations=[
+            [start_point["lat"], start_point["lon"]],
+            [end_point["lat"], end_point["lon"]],
+        ],
+        color=route_color,
+        weight=5,
+        opacity=0.86,
+        tooltip=route_tooltip,
+    ).add_to(map_obj)
+
+
+def render_route_summary_card(start_name, end_name, mode, distance_km, rainfall, score):
+    score_color = "#16a34a"
+    if score >= 75:
+        score_color = "#dc2626"
+    elif score >= 50:
+        score_color = "#d97706"
+
+    st.markdown(
+        f"""
+<div class="route-card">
+    <div class="section-head route-head">
+        <h3>Route Preview</h3>
+        <span>임시 직선 경로</span>
+    </div>
+    <div class="route-grid">
+        <div><span>출발지</span><b>{start_name}</b></div>
+        <div><span>도착지</span><b>{end_name}</b></div>
+        <div><span>기준</span><b>{mode}</b></div>
+        <div><span>직선거리</span><b>{distance_km:.2f} km</b></div>
+        <div><span>강수량</span><b>{rainfall}</b></div>
+        <div><span>임시 위험도</span><b style="color:{score_color}">{score}점</b></div>
+    </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
 def render_data_status_card(summary, messages, expected_stage_label, expected_feature_count):
     rows = "".join(
         f"""
@@ -958,6 +1059,49 @@ st.markdown(
         box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08);
     }
 
+    .route-card {
+        background: #ffffff;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 16px 18px;
+        margin-top: 14px;
+        box-shadow: 0 10px 26px rgba(15, 23, 42, 0.06);
+    }
+
+    .route-head {
+        margin-bottom: 14px;
+    }
+
+    .route-grid {
+        display: grid;
+        grid-template-columns: repeat(6, minmax(0, 1fr));
+        gap: 12px;
+    }
+
+    .route-grid div {
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 12px;
+        background: #f8fafc;
+        min-height: 72px;
+    }
+
+    .route-grid span {
+        display: block;
+        color: #64748b;
+        font-size: 12px;
+        font-weight: 800;
+        margin-bottom: 7px;
+    }
+
+    .route-grid b {
+        display: block;
+        color: #172033;
+        font-size: 18px;
+        line-height: 1.2;
+        font-weight: 950;
+    }
+
     .section-head {
         display: flex;
         justify-content: space-between;
@@ -1020,6 +1164,10 @@ st.markdown(
         .metric-grid {
             grid-template-columns: 1fr;
         }
+
+        .route-grid {
+            grid-template-columns: 1fr 1fr;
+        }
     }
 </style>
 """,
@@ -1045,6 +1193,25 @@ mode = st.sidebar.radio(
     "경로 추천 기준",
     ["최단경로", "안전경로"],
 )
+
+route_points = get_route_points()
+route_point_names = list(route_points)
+
+st.sidebar.markdown(
+    """
+<div style="margin-top:18px; margin-bottom:6px; color:#172033; font-size:14px; font-weight:900;">
+    경로 지점 선택
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+start_name = st.sidebar.selectbox("출발지", route_point_names, index=0)
+end_name = st.sidebar.selectbox("도착지", route_point_names, index=3)
+start_point = route_points[start_name]
+end_point = route_points[end_name]
+route_distance_km = calculate_distance_km(start_point, end_point)
+route_score = get_temporary_route_score(rainfall, mode)
 
 st.sidebar.markdown(
     """
@@ -1243,6 +1410,7 @@ add_polygon_layer(
 )
 
 add_ai_prediction_layer(m, ai_predictions, show_ai_layer)
+add_route_layer(m, start_point, end_point, mode)
 
 folium.Marker(
     location=analysis_center,
@@ -1310,8 +1478,17 @@ st.markdown(
 map_key = (
     f"rainguard_map_stable_{base_map_style}_{rainfall}_{show_expected}_"
     f"{show_history_2022}_{show_history_2023}_{show_history_other}_"
-    f"{show_ai_layer}_{expected_stage_label}"
+    f"{show_ai_layer}_{expected_stage_label}_{mode}_{start_name}_{end_name}"
 )
 st_folium(m, width=1240, height=620, key=map_key, returned_objects=[])
 
 st.markdown("</div>", unsafe_allow_html=True)
+
+render_route_summary_card(
+    start_name,
+    end_name,
+    mode,
+    route_distance_km,
+    rainfall,
+    route_score,
+)
