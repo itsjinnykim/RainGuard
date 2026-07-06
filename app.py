@@ -3,6 +3,7 @@ import folium
 import json
 import math
 import pandas as pd
+import pickle
 import re
 import warnings
 from pathlib import Path
@@ -24,6 +25,13 @@ try:
 except ImportError:
     joblib = None
 
+try:
+    import networkx as nx
+    import osmnx as ox
+except ImportError:
+    nx = None
+    ox = None
+
 
 st.set_page_config(
     page_title="RainGuard",
@@ -41,6 +49,8 @@ AI_GRID_PATH = DATA_DIR / "processed" / "flood_grid.geojson"
 MODEL_DIR = BASE_DIR / "models"
 MODEL_PATH = MODEL_DIR / "flood_random_forest.joblib"
 MODEL_METRICS_PATH = MODEL_DIR / "model_metrics.csv"
+ROAD_GRAPH_PATH = DATA_DIR / "road_network" / "gangnam_walk.graphml"
+ROAD_GRAPH_PICKLE_PATH = DATA_DIR / "road_network" / "gangnam_walk.pkl"
 
 AI_FEATURE_COLUMNS = [
     "latitude",
@@ -429,6 +439,24 @@ def load_ai_metrics(signature):
     return dict(zip(metrics_df["metric"], metrics_df["value"]))
 
 
+def build_road_graph_signature():
+    graph_path = ROAD_GRAPH_PICKLE_PATH if ROAD_GRAPH_PICKLE_PATH.exists() else ROAD_GRAPH_PATH
+    if not graph_path.exists():
+        return None
+    return (str(graph_path), graph_path.stat().st_mtime, graph_path.stat().st_size)
+
+
+@st.cache_resource(show_spinner=False)
+def load_road_graph(signature):
+    if signature is None or ox is None or nx is None:
+        return None
+    graph_path = Path(signature[0])
+    if graph_path.suffix.lower() == ".pkl":
+        with graph_path.open("rb") as f:
+            return pickle.load(f)
+    return ox.load_graphml(graph_path)
+
+
 def format_percent(value, decimals=1):
     if value is None:
         return "-"
@@ -685,7 +713,168 @@ def get_temporary_route_score(rainfall, mode):
     return base_score
 
 
-def add_route_layer(map_obj, start_point, end_point, mode):
+def get_route_risk_points(prediction_df):
+    required = {"latitude", "longitude", "ai_risk_probability"}
+    if prediction_df.empty or not required.issubset(prediction_df.columns):
+        return []
+    route_df = prediction_df[["latitude", "longitude", "ai_risk_probability"]].dropna()
+    return [
+        (float(row.latitude), float(row.longitude), float(row.ai_risk_probability))
+        for row in route_df.itertuples(index=False)
+    ]
+
+
+def nearest_risk_probability(lat, lon, risk_points):
+    if not risk_points:
+        return 0.0
+    nearest = min(
+        risk_points,
+        key=lambda point: (point[0] - lat) ** 2 + (point[1] - lon) ** 2,
+    )
+    return nearest[2]
+
+
+def edge_length_m(graph, u, v, data):
+    if data and data.get("length") is not None:
+        return float(data["length"])
+    start = {"lat": float(graph.nodes[u]["y"]), "lon": float(graph.nodes[u]["x"])}
+    end = {"lat": float(graph.nodes[v]["y"]), "lon": float(graph.nodes[v]["x"])}
+    return calculate_distance_km(start, end) * 1000
+
+
+def best_edge_data(graph, u, v):
+    edge_data = graph.get_edge_data(u, v, default={})
+    if not edge_data:
+        return {}
+    if all(isinstance(value, dict) for value in edge_data.values()):
+        return min(edge_data.values(), key=lambda item: float(item.get("length", 0) or 0))
+    return edge_data
+
+
+def edge_midpoint(graph, u, v, data):
+    geometry = data.get("geometry") if data else None
+    if geometry is not None and hasattr(geometry, "interpolate"):
+        point = geometry.interpolate(0.5, normalized=True)
+        return float(point.y), float(point.x)
+    start_lat = float(graph.nodes[u]["y"])
+    start_lon = float(graph.nodes[u]["x"])
+    end_lat = float(graph.nodes[v]["y"])
+    end_lon = float(graph.nodes[v]["x"])
+    return (start_lat + end_lat) / 2, (start_lon + end_lon) / 2
+
+
+def apply_safe_edge_weights(graph, risk_points, rainfall):
+    alpha_by_rainfall = {
+        "10mm/h": 1.2,
+        "30mm/h": 2.2,
+        "50mm/h": 3.2,
+    }
+    alpha = alpha_by_rainfall.get(rainfall, 2.2)
+    for u, v, _key, data in graph.edges(keys=True, data=True):
+        mid_lat, mid_lon = edge_midpoint(graph, u, v, data)
+        risk_probability = nearest_risk_probability(mid_lat, mid_lon, risk_points)
+        length = edge_length_m(graph, u, v, data)
+        data["route_risk_probability"] = risk_probability
+        data["safe_length"] = length * (1 + alpha * risk_probability)
+
+
+def route_to_coordinates(graph, route_nodes):
+    coordinates = []
+    if len(route_nodes) == 1:
+        node = graph.nodes[route_nodes[0]]
+        return [[float(node["y"]), float(node["x"])]]
+
+    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        data = best_edge_data(graph, u, v)
+        geometry = data.get("geometry") if data else None
+        if geometry is not None and hasattr(geometry, "coords"):
+            segment = [[float(lat), float(lon)] for lon, lat in geometry.coords]
+        else:
+            segment = [
+                [float(graph.nodes[u]["y"]), float(graph.nodes[u]["x"])],
+                [float(graph.nodes[v]["y"]), float(graph.nodes[v]["x"])],
+            ]
+
+        if coordinates and segment and coordinates[-1] == segment[0]:
+            coordinates.extend(segment[1:])
+        else:
+            coordinates.extend(segment)
+
+    return coordinates
+
+
+def route_length_km(graph, route_nodes):
+    total_m = 0.0
+    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        data = best_edge_data(graph, u, v)
+        total_m += edge_length_m(graph, u, v, data)
+    return round(total_m / 1000, 2)
+
+
+def route_average_risk(graph, route_nodes):
+    risks = []
+    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        data = best_edge_data(graph, u, v)
+        if data and data.get("route_risk_probability") is not None:
+            risks.append(float(data["route_risk_probability"]))
+    if not risks:
+        return None
+    return sum(risks) / len(risks)
+
+
+def get_route_score(rainfall, mode, average_risk=None):
+    if average_risk is None:
+        return get_temporary_route_score(rainfall, mode)
+    base_score = get_temporary_route_score(rainfall, "최단경로")
+    score = round(base_score * 0.55 + average_risk * 100 * 0.45)
+    if mode == "안전경로":
+        score = max(score - 8, 0)
+    return min(score, 100)
+
+
+def calculate_route_result(start_point, end_point, mode, rainfall, ai_predictions):
+    fallback = {
+        "coordinates": [[start_point["lat"], start_point["lon"]], [end_point["lat"], end_point["lon"]]],
+        "distance_km": calculate_distance_km(start_point, end_point),
+        "score": get_temporary_route_score(rainfall, mode),
+        "route_type": "직선 연결",
+        "is_network_route": False,
+    }
+
+    graph = load_road_graph(build_road_graph_signature())
+    if graph is None:
+        return fallback
+
+    try:
+        origin_node = ox.distance.nearest_nodes(graph, X=start_point["lon"], Y=start_point["lat"])
+        destination_node = ox.distance.nearest_nodes(graph, X=end_point["lon"], Y=end_point["lat"])
+        risk_points = get_route_risk_points(ai_predictions)
+        weight = "length"
+        route_type = "OSM 최단경로"
+
+        if mode == "안전경로" and risk_points:
+            apply_safe_edge_weights(graph, risk_points, rainfall)
+            weight = "safe_length"
+            route_type = "AI 위험 반영 경로"
+
+        route_nodes = nx.shortest_path(graph, origin_node, destination_node, weight=weight)
+        coordinates = route_to_coordinates(graph, route_nodes)
+        if len(coordinates) < 2:
+            return fallback
+
+        average_risk = route_average_risk(graph, route_nodes)
+        return {
+            "coordinates": coordinates,
+            "distance_km": route_length_km(graph, route_nodes),
+            "score": get_route_score(rainfall, mode, average_risk),
+            "route_type": route_type,
+            "is_network_route": True,
+        }
+    except Exception:
+        return fallback
+
+
+def add_route_layer(map_obj, start_point, end_point, mode, route_result):
     route_color = "#2563eb" if mode == "최단경로" else "#7c3aed"
     route_tooltip = "최단경로 후보" if mode == "최단경로" else "안전경로 후보"
 
@@ -704,10 +893,7 @@ def add_route_layer(map_obj, start_point, end_point, mode):
     ).add_to(map_obj)
 
     folium.PolyLine(
-        locations=[
-            [start_point["lat"], start_point["lon"]],
-            [end_point["lat"], end_point["lon"]],
-        ],
+        locations=route_result["coordinates"],
         color=route_color,
         weight=5,
         opacity=0.86,
@@ -715,7 +901,7 @@ def add_route_layer(map_obj, start_point, end_point, mode):
     ).add_to(map_obj)
 
 
-def render_route_summary_card(start_name, end_name, mode, distance_km, rainfall, score):
+def render_route_summary_card(start_name, end_name, mode, distance_km, rainfall, score, route_type):
     score_color = "#16a34a"
     if score >= 75:
         score_color = "#dc2626"
@@ -727,7 +913,7 @@ def render_route_summary_card(start_name, end_name, mode, distance_km, rainfall,
 <div class="route-card">
     <div class="section-head route-head">
         <h3>Route Preview</h3>
-        <span>임시 직선 경로</span>
+        <span>{route_type}</span>
     </div>
     <div class="route-grid">
         <div><span>출발지</span><b>{start_name}</b></div>
@@ -1210,8 +1396,6 @@ start_name = st.sidebar.selectbox("출발지", route_point_names, index=0)
 end_name = st.sidebar.selectbox("도착지", route_point_names, index=3)
 start_point = route_points[start_name]
 end_point = route_points[end_name]
-route_distance_km = calculate_distance_km(start_point, end_point)
-route_score = get_temporary_route_score(rainfall, mode)
 
 st.sidebar.markdown(
     """
@@ -1249,6 +1433,7 @@ ai_avg_text = format_percent(ai_summary["avg_probability"], 1)
 ai_recall_text = format_percent(ai_summary["recall"], 1)
 ai_cells_text = f"{ai_summary['risk_cell_count']:,}개" if ai_summary["ready"] else "-"
 ai_color = ai_risk_color(ai_summary["avg_probability"] or 0)
+route_result = calculate_route_result(start_point, end_point, mode, rainfall, ai_predictions)
 
 max_expected_stage = EXPECTED_STAGE_BY_RAINFALL[rainfall]
 spatial_layer_requested = show_expected or show_history_2022 or show_history_2023 or show_history_other
@@ -1410,7 +1595,7 @@ add_polygon_layer(
 )
 
 add_ai_prediction_layer(m, ai_predictions, show_ai_layer)
-add_route_layer(m, start_point, end_point, mode)
+add_route_layer(m, start_point, end_point, mode, route_result)
 
 folium.Marker(
     location=analysis_center,
@@ -1488,7 +1673,8 @@ render_route_summary_card(
     start_name,
     end_name,
     mode,
-    route_distance_km,
+    route_result["distance_km"],
     rainfall,
-    route_score,
+    route_result["score"],
+    route_result["route_type"],
 )

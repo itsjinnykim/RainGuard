@@ -5,3 +5,5 @@ geopandas==1.1.4
 scikit-learn==1.9.0
 matplotlib==3.11.0
 joblib==1.5.3
+networkx==3.6.1
+osmnx==2.1.0
