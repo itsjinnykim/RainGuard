@@ -1108,7 +1108,7 @@ analysis_center = [37.5172, 127.0473]
 m = folium.Map(
     location=analysis_center,
     zoom_start=13,
-    tiles="CartoDB positron",
+    tiles="OpenStreetMap",
     prefer_canvas=True,
 )
 
@@ -1226,7 +1226,7 @@ st.markdown(
 )
 
 map_key = (
-    f"rainguard_map_{rainfall}_{show_expected}_"
+    f"rainguard_map_osm_{rainfall}_{show_expected}_"
     f"{show_history_2022}_{show_history_2023}_{show_history_other}_"
     f"{show_ai_layer}_{expected_stage_label}"
 )
