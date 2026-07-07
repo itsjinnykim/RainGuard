@@ -2321,6 +2321,10 @@ m = folium.Map(
     zoom_start=13,
     tiles=base_map_style,
     prefer_canvas=True,
+    dragging=route_input_method != "지도에서 직접 선택",
+    scrollWheelZoom=route_input_method != "지도에서 직접 선택",
+    doubleClickZoom=route_input_method != "지도에서 직접 선택",
+    touchZoom=route_input_method != "지도에서 직접 선택",
 )
 
 if base_map_style == "CartoDB positron":
@@ -2332,6 +2336,18 @@ if base_map_style == "CartoDB positron":
     </style>
     """
     m.get_root().header.add_child(folium.Element(tile_tone_css))
+
+if route_input_method == "지도에서 직접 선택":
+    click_select_css = """
+    <style>
+        .leaflet-container,
+        .leaflet-grab,
+        .leaflet-dragging .leaflet-grab {
+            cursor: crosshair !important;
+        }
+    </style>
+    """
+    m.get_root().header.add_child(folium.Element(click_select_css))
 
 for stage in visible_expected_stages:
     style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
