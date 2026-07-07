@@ -57,6 +57,9 @@ MODEL_METRICS_PATH = MODEL_DIR / "model_metrics.csv"
 ROAD_GRAPH_PATH = DATA_DIR / "road_network" / "gangnam_walk.graphml"
 ROAD_GRAPH_PICKLE_PATH = DATA_DIR / "road_network" / "gangnam_walk.pkl"
 
+CLICK_ROUTE_MIN_DISTANCE_KM = 0.08
+CLICK_ROUTE_MAX_NODE_DISTANCE_M = 900
+
 AI_FEATURE_COLUMNS = [
     "latitude",
     "longitude",
@@ -713,6 +716,93 @@ def calculate_distance_km(start, end):
     return round(earth_radius_km * c, 2)
 
 
+def format_route_point_signature(point):
+    if not point:
+        return "none"
+    return f"{point['lat']:.6f},{point['lon']:.6f}"
+
+
+def make_clicked_route_point(label, coordinate):
+    if not coordinate:
+        return None
+    return {
+        "name": label,
+        "lat": float(coordinate["lat"]),
+        "lon": float(coordinate["lon"]),
+        "tooltip": label,
+    }
+
+
+def nearest_graph_node_with_distance(graph, point):
+    node = ox.distance.nearest_nodes(graph, X=point["lon"], Y=point["lat"])
+    node_data = graph.nodes[node]
+    node_point = {"lat": float(node_data["y"]), "lon": float(node_data["x"])}
+    distance_m = calculate_distance_km(point, node_point) * 1000
+    return node, distance_m
+
+
+def initialize_click_route_state():
+    defaults = {
+        "clicked_start": None,
+        "clicked_end": None,
+        "clicked_last_signature": None,
+        "clicked_route_results": None,
+        "clicked_route_context": None,
+        "clicked_route_notice": "",
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def clear_clicked_route_selection():
+    st.session_state.clicked_start = None
+    st.session_state.clicked_end = None
+    st.session_state.clicked_last_signature = None
+    st.session_state.clicked_route_results = None
+    st.session_state.clicked_route_context = None
+    st.session_state.clicked_route_notice = ""
+
+
+def build_clicked_route_context(start_coordinate, end_coordinate, mode, rainfall, show_route_comparison):
+    return {
+        "start": format_route_point_signature(start_coordinate),
+        "end": format_route_point_signature(end_coordinate),
+        "mode": mode,
+        "rainfall": rainfall,
+        "show_route_comparison": bool(show_route_comparison),
+    }
+
+
+def handle_map_click_selection(last_clicked):
+    if not last_clicked:
+        return
+
+    lat = last_clicked.get("lat")
+    lon = last_clicked.get("lng", last_clicked.get("lon"))
+    if lat is None or lon is None:
+        return
+
+    coordinate = {"lat": float(lat), "lon": float(lon)}
+    signature = format_route_point_signature(coordinate)
+    if signature == st.session_state.clicked_last_signature:
+        return
+
+    if st.session_state.clicked_start is None:
+        st.session_state.clicked_start = coordinate
+        st.session_state.clicked_route_notice = "출발지가 저장되었습니다. 도착지를 선택해주세요."
+    elif st.session_state.clicked_end is None:
+        st.session_state.clicked_end = coordinate
+        st.session_state.clicked_route_notice = "도착지가 저장되었습니다. 경로 계산 버튼을 눌러주세요."
+    else:
+        st.session_state.clicked_route_notice = "출발지와 도착지가 이미 선택되었습니다. 초기화 후 다시 선택해주세요."
+
+    st.session_state.clicked_last_signature = signature
+    st.session_state.clicked_route_results = None
+    st.session_state.clicked_route_context = None
+    st.rerun()
+
+
 def get_temporary_route_score(rainfall, mode):
     base_scores = {
         "10mm/h": 30,
@@ -1130,6 +1220,16 @@ def calculate_route_results(start_point, end_point, mode, rainfall, ai_predictio
             "improvement_text": "출발지와 도착지가 같습니다.",
         }
 
+    if calculate_distance_km(start_point, end_point) < CLICK_ROUTE_MIN_DISTANCE_KM:
+        warning = "출발지와 도착지가 너무 가까워 경로 비교를 생략했습니다."
+        return {
+            "shortest": straight_shortest,
+            "safe": straight_safe,
+            "selected": straight_safe if mode == "안전경로" else straight_shortest,
+            "warnings": [warning],
+            "improvement_text": "두 지점이 너무 가깝습니다.",
+        }
+
     graph = load_road_graph(build_road_graph_signature())
     if graph is None:
         warning = "도로망 데이터를 불러오지 못해 직선 연결로 표시합니다."
@@ -1142,8 +1242,18 @@ def calculate_route_results(start_point, end_point, mode, rainfall, ai_predictio
         }
 
     try:
-        origin_node = ox.distance.nearest_nodes(graph, X=start_point["lon"], Y=start_point["lat"])
-        destination_node = ox.distance.nearest_nodes(graph, X=end_point["lon"], Y=end_point["lat"])
+        origin_node, origin_distance_m = nearest_graph_node_with_distance(graph, start_point)
+        destination_node, destination_distance_m = nearest_graph_node_with_distance(graph, end_point)
+        if max(origin_distance_m, destination_distance_m) > CLICK_ROUTE_MAX_NODE_DISTANCE_M:
+            warning = "선택한 지점이 도로망과 너무 멀어 직선 연결로 표시합니다."
+            return {
+                "shortest": straight_shortest,
+                "safe": straight_safe,
+                "selected": straight_safe if mode == "안전경로" else straight_shortest,
+                "warnings": [warning],
+                "improvement_text": "가까운 도로 노드를 안정적으로 찾지 못했습니다.",
+            }
+
         risk_points = get_route_risk_points(ai_predictions)
         warnings = []
         if not risk_points:
@@ -1241,17 +1351,35 @@ def calculate_route_results(start_point, end_point, mode, rainfall, ai_predictio
 def add_route_markers(map_obj, start_point, end_point):
     folium.Marker(
         location=[start_point["lat"], start_point["lon"]],
-        tooltip=f"출발지: {start_point['name']}",
+        tooltip=start_point.get("tooltip", f"출발지: {start_point['name']}"),
         popup=start_point["name"],
         icon=folium.Icon(color="green", icon="play"),
     ).add_to(map_obj)
 
     folium.Marker(
         location=[end_point["lat"], end_point["lon"]],
-        tooltip=f"도착지: {end_point['name']}",
+        tooltip=end_point.get("tooltip", f"도착지: {end_point['name']}"),
         popup=end_point["name"],
         icon=folium.Icon(color="red", icon="stop"),
     ).add_to(map_obj)
+
+
+def add_click_route_markers(map_obj, start_point, end_point):
+    if start_point is not None:
+        folium.Marker(
+            location=[start_point["lat"], start_point["lon"]],
+            tooltip="클릭 출발지",
+            popup="클릭 출발지",
+            icon=folium.Icon(color="green", icon="play"),
+        ).add_to(map_obj)
+
+    if end_point is not None:
+        folium.Marker(
+            location=[end_point["lat"], end_point["lon"]],
+            tooltip="클릭 도착지",
+            popup="클릭 도착지",
+            icon=folium.Icon(color="red", icon="stop"),
+        ).add_to(map_obj)
 
 
 def draw_route_line(map_obj, route_result, color, weight, opacity, tooltip, dash_array=None):
@@ -1908,6 +2036,8 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
+initialize_click_route_state()
+
 rainfall = st.sidebar.selectbox(
     "강수량 시나리오 선택",
     ["10mm/h", "30mm/h", "50mm/h"],
@@ -1925,18 +2055,103 @@ route_point_names = list(route_points)
 st.sidebar.markdown(
     """
 <div style="margin-top:18px; margin-bottom:6px; color:#172033; font-size:14px; font-weight:900;">
-    경로 지점 선택
+    경로 입력 방식
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-default_start_index = route_point_names.index("강남역") if "강남역" in route_point_names else 0
-default_end_index = route_point_names.index("삼성역") if "삼성역" in route_point_names else 0
-start_name = st.sidebar.selectbox("출발지", route_point_names, index=default_start_index)
-end_name = st.sidebar.selectbox("도착지", route_point_names, index=default_end_index)
-start_point = route_points[start_name]
-end_point = route_points[end_name]
+route_input_method = st.sidebar.radio(
+    "경로 입력 방식",
+    ["주요 지점 선택", "지도에서 직접 선택"],
+    label_visibility="collapsed",
+)
+
+start_point = None
+end_point = None
+start_name = "미선택"
+end_name = "미선택"
+click_route_calculate = False
+clicked_route_context = None
+clicked_start_point = make_clicked_route_point("클릭 출발지", st.session_state.clicked_start)
+clicked_end_point = make_clicked_route_point("클릭 도착지", st.session_state.clicked_end)
+
+if route_input_method == "주요 지점 선택":
+    st.sidebar.markdown(
+        """
+<div style="margin-top:18px; margin-bottom:6px; color:#172033; font-size:14px; font-weight:900;">
+    경로 지점 선택
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    default_start_index = route_point_names.index("강남역") if "강남역" in route_point_names else 0
+    default_end_index = route_point_names.index("삼성역") if "삼성역" in route_point_names else 0
+    start_name = st.sidebar.selectbox("출발지", route_point_names, index=default_start_index)
+    end_name = st.sidebar.selectbox("도착지", route_point_names, index=default_end_index)
+    start_point = route_points[start_name]
+    end_point = route_points[end_name]
+else:
+    st.sidebar.markdown(
+        """
+<div style="margin-top:10px; color:#475569; font-size:13px; line-height:1.6;">
+지도에서 첫 번째 클릭은 출발지, 두 번째 클릭은 도착지로 저장됩니다. 두 지점을 선택한 뒤 경로 계산 버튼을 눌러주세요.
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+    col_reset, col_status = st.sidebar.columns([1, 1])
+    with col_reset:
+        if st.button(
+            "선택 초기화",
+            disabled=st.session_state.clicked_start is None and st.session_state.clicked_end is None,
+            use_container_width=True,
+        ):
+            clear_clicked_route_selection()
+            st.rerun()
+    with col_status:
+        st.caption("클릭 선택")
+
+    if clicked_start_point is not None:
+        st.sidebar.caption(
+            f"출발지: {clicked_start_point['lat']:.5f}, {clicked_start_point['lon']:.5f}"
+        )
+    else:
+        st.sidebar.caption("출발지: 지도에서 선택")
+
+    if clicked_end_point is not None:
+        st.sidebar.caption(
+            f"도착지: {clicked_end_point['lat']:.5f}, {clicked_end_point['lon']:.5f}"
+        )
+    else:
+        st.sidebar.caption("도착지: 지도에서 선택")
+
+    if st.session_state.clicked_route_notice:
+        st.sidebar.info(st.session_state.clicked_route_notice)
+
+    start_point = clicked_start_point
+    end_point = clicked_end_point
+    start_name = format_route_point_signature(st.session_state.clicked_start)
+    end_name = format_route_point_signature(st.session_state.clicked_end)
+    clicked_route_context = build_clicked_route_context(
+        st.session_state.clicked_start,
+        st.session_state.clicked_end,
+        mode,
+        rainfall,
+        show_route_comparison,
+    )
+    click_route_ready = clicked_start_point is not None and clicked_end_point is not None
+    click_route_calculate = st.sidebar.button(
+        "경로 계산",
+        disabled=not click_route_ready,
+        use_container_width=True,
+    )
+    if (
+        click_route_ready
+        and st.session_state.clicked_route_results is not None
+        and st.session_state.clicked_route_context != clicked_route_context
+    ):
+        st.sidebar.warning("선택 또는 옵션이 바뀌었습니다. 경로 계산을 다시 눌러주세요.")
 
 st.sidebar.markdown(
     """
@@ -1958,7 +2173,8 @@ base_map_style = st.sidebar.selectbox(
 )
 
 risk = RISK_BY_RAINFALL[rainfall]
-route_needs_ai = mode == "안전경로" or show_route_comparison
+route_should_calculate_now = route_input_method == "주요 지점 선택" or click_route_calculate
+route_needs_ai = route_should_calculate_now and (mode == "안전경로" or show_route_comparison)
 if show_ai_layer or route_needs_ai:
     ai_predictions, ai_summary = get_ai_predictions(rainfall)
 else:
@@ -1975,15 +2191,36 @@ ai_avg_text = format_percent(ai_summary["avg_probability"], 1)
 ai_recall_text = format_percent(ai_summary["recall"], 1)
 ai_cells_text = f"{ai_summary['risk_cell_count']:,}개" if ai_summary["ready"] else "-"
 ai_color = ai_risk_color(ai_summary["avg_probability"] or 0)
-route_results = calculate_route_results(
-    start_point,
-    end_point,
-    mode,
-    rainfall,
-    ai_predictions,
-    need_safe_route=route_needs_ai,
-)
-route_result = route_results["selected"]
+
+route_results = None
+if route_input_method == "주요 지점 선택":
+    route_results = calculate_route_results(
+        start_point,
+        end_point,
+        mode,
+        rainfall,
+        ai_predictions,
+        need_safe_route=route_needs_ai,
+    )
+elif click_route_calculate and start_point is not None and end_point is not None:
+    route_results = calculate_route_results(
+        start_point,
+        end_point,
+        mode,
+        rainfall,
+        ai_predictions,
+        need_safe_route=route_needs_ai,
+    )
+    st.session_state.clicked_route_results = route_results
+    st.session_state.clicked_route_context = clicked_route_context
+elif (
+    clicked_route_context is not None
+    and st.session_state.clicked_route_context == clicked_route_context
+    and st.session_state.clicked_route_results is not None
+):
+    route_results = st.session_state.clicked_route_results
+
+route_result = route_results["selected"] if route_results is not None else None
 
 max_expected_stage = EXPECTED_STAGE_BY_RAINFALL[rainfall]
 spatial_layer_requested = show_expected or show_history_2022 or show_history_2023 or show_history_other
@@ -2145,13 +2382,16 @@ add_polygon_layer(
 )
 
 add_ai_prediction_layer(m, ai_predictions, show_ai_layer)
-add_comparison_routes_to_map(
-    m,
-    route_results["shortest"],
-    route_results["safe"],
-    mode,
-    show_route_comparison,
-)
+if route_results is not None:
+    add_comparison_routes_to_map(
+        m,
+        route_results["shortest"],
+        route_results["safe"],
+        mode,
+        show_route_comparison,
+    )
+elif route_input_method == "지도에서 직접 선택":
+    add_click_route_markers(m, clicked_start_point, clicked_end_point)
 
 folium.Marker(
     location=analysis_center,
@@ -2216,22 +2456,53 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+map_style_key = "cartodb" if base_map_style == "CartoDB positron" else "osm"
+rainfall_key = rainfall.replace("/", "_").replace(" ", "")
+route_input_key = "click" if route_input_method == "지도에서 직접 선택" else "preset"
+mode_key = "safe" if mode == "안전경로" else "shortest"
+if route_input_method == "지도에서 직접 선택":
+    start_key = format_route_point_signature(st.session_state.clicked_start).replace(",", "_").replace(".", "p")
+    end_key = format_route_point_signature(st.session_state.clicked_end).replace(",", "_").replace(".", "p")
+else:
+    start_key = str(route_point_names.index(start_name)) if start_name in route_point_names else "0"
+    end_key = str(route_point_names.index(end_name)) if end_name in route_point_names else "0"
+
 map_key = (
-    f"rainguard_map_stable_{base_map_style}_{rainfall}_{show_expected}_"
-    f"{show_history_2022}_{show_history_2023}_{show_history_other}_"
-    f"{show_ai_layer}_{expected_stage_label}_{mode}_{start_name}_{end_name}_"
-    f"{show_route_comparison}_safe_v2"
+    f"rainguard_map_v4_{map_style_key}_{rainfall_key}_{int(show_expected)}_"
+    f"{int(show_history_2022)}_{int(show_history_2023)}_{int(show_history_other)}_"
+    f"{int(show_ai_layer)}_{max_expected_stage}_{mode_key}_{route_input_key}_"
+    f"{start_key}_{end_key}_{int(show_route_comparison)}"
 )
-st_folium(m, width=1240, height=620, key=map_key, returned_objects=[])
+map_returned_objects = (
+    ["last_clicked", "last_object_clicked"]
+    if route_input_method == "지도에서 직접 선택"
+    else []
+)
+map_data = st_folium(
+    m,
+    width=1240,
+    height=620,
+    key=map_key,
+    returned_objects=map_returned_objects,
+)
+
+if route_input_method == "지도에서 직접 선택":
+    clicked_location = None
+    if isinstance(map_data, dict):
+        clicked_location = map_data.get("last_clicked") or map_data.get("last_object_clicked")
+    handle_map_click_selection(clicked_location)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-if show_route_comparison or mode == "안전경로":
-    render_route_comparison(
-        route_results["shortest"]["summary"],
-        route_results["safe"]["summary"],
-        route_results["warnings"],
-        route_results["improvement_text"],
-    )
-else:
-    render_route_selected_card(route_result, mode, rainfall)
+if route_results is not None:
+    if show_route_comparison or mode == "안전경로":
+        render_route_comparison(
+            route_results["shortest"]["summary"],
+            route_results["safe"]["summary"],
+            route_results["warnings"],
+            route_results["improvement_text"],
+        )
+    else:
+        render_route_selected_card(route_result, mode, rainfall)
+elif route_input_method == "지도에서 직접 선택":
+    st.info("지도에서 출발지와 도착지를 선택한 뒤 경로 계산 버튼을 눌러주세요.")
