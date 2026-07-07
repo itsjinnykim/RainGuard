@@ -670,14 +670,29 @@ def add_polygon_layer(map_obj, gdf, name, color, fill_color, fill_opacity, weigh
 
 def get_route_points():
     return {
+        "신사역": {"name": "신사역", "lat": 37.5163, "lon": 127.0200},
+        "논현역": {"name": "논현역", "lat": 37.5111, "lon": 127.0214},
+        "신논현역": {"name": "신논현역", "lat": 37.5046, "lon": 127.0250},
         "강남역": {"name": "강남역", "lat": 37.4979, "lon": 127.0276},
         "역삼역": {"name": "역삼역", "lat": 37.5007, "lon": 127.0365},
         "선릉역": {"name": "선릉역", "lat": 37.5045, "lon": 127.0490},
         "삼성역": {"name": "삼성역", "lat": 37.5088, "lon": 127.0632},
-        "코엑스": {"name": "코엑스", "lat": 37.5118, "lon": 127.0592},
+        "봉은사역": {"name": "봉은사역", "lat": 37.5142, "lon": 127.0602},
+        "청담역": {"name": "청담역", "lat": 37.5194, "lon": 127.0530},
         "강남구청역": {"name": "강남구청역", "lat": 37.5172, "lon": 127.0413},
         "압구정로데오역": {"name": "압구정로데오역", "lat": 37.5275, "lon": 127.0406},
+        "선정릉역": {"name": "선정릉역", "lat": 37.5110, "lon": 127.0436},
+        "한티역": {"name": "한티역", "lat": 37.4963, "lon": 127.0529},
+        "도곡역": {"name": "도곡역", "lat": 37.4909, "lon": 127.0555},
         "대치역": {"name": "대치역", "lat": 37.4945, "lon": 127.0632},
+        "학여울역": {"name": "학여울역", "lat": 37.4967, "lon": 127.0706},
+        "대청역": {"name": "대청역", "lat": 37.4936, "lon": 127.0795},
+        "일원역": {"name": "일원역", "lat": 37.4837, "lon": 127.0844},
+        "수서역": {"name": "수서역", "lat": 37.4875, "lon": 127.1015},
+        "세곡동 주민센터": {"name": "세곡동 주민센터", "lat": 37.4690, "lon": 127.1068},
+        "강남세브란스병원": {"name": "강남세브란스병원", "lat": 37.4928, "lon": 127.0463},
+        "삼성서울병원": {"name": "삼성서울병원", "lat": 37.4883, "lon": 127.0851},
+        "코엑스": {"name": "코엑스", "lat": 37.5118, "lon": 127.0592},
     }
 
 
@@ -1916,8 +1931,10 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-start_name = st.sidebar.selectbox("출발지", route_point_names, index=0)
-end_name = st.sidebar.selectbox("도착지", route_point_names, index=3)
+default_start_index = route_point_names.index("강남역") if "강남역" in route_point_names else 0
+default_end_index = route_point_names.index("삼성역") if "삼성역" in route_point_names else 0
+start_name = st.sidebar.selectbox("출발지", route_point_names, index=default_start_index)
+end_name = st.sidebar.selectbox("도착지", route_point_names, index=default_end_index)
 start_point = route_points[start_name]
 end_point = route_points[end_name]
 

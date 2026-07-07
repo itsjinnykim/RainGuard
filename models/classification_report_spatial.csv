@@ -1,0 +1,6 @@
+﻿validation_split,class,precision,recall,f1-score,support
+spatial_east_holdout,0,1.0,1.0,1.0,121.0
+spatial_east_holdout,1,1.0,1.0,1.0,32.0
+spatial_east_holdout,accuracy,1.0,1.0,1.0,1.0
+spatial_east_holdout,macro avg,1.0,1.0,1.0,153.0
+spatial_east_holdout,weighted avg,1.0,1.0,1.0,153.0

@@ -1,0 +1,22 @@
+﻿column,exists_in_dataset,used_as_feature,category,status,note
+distance_to_flood_area_m,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.
+expected_stage,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.
+flood_expected,True,False,label_source_binary,pass,Binary source used in earlier label construction; excluded from v2 features.
+flood_history,True,False,label_source_binary,pass,Binary source used in earlier label construction; excluded from v2 features.
+flood_history_2022,True,False,label_source_binary,pass,Binary source used in earlier label construction; excluded from v2 features.
+flood_history_2023,True,False,label_source_binary,pass,Binary source used in earlier label construction; excluded from v2 features.
+flood_history_old,True,False,label_source_binary,pass,Binary source used in earlier label construction; excluded from v2 features.
+flood_history_recent,True,False,label_source_binary,pass,Binary source used in earlier label construction; excluded from v2 features.
+flood_label,True,False,direct_label_or_score,pass,"Direct label, risk score, or grade column."
+history_polygon_count,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.
+history_recency_score,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.
+history_recent_polygon_count,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.
+history_year_count,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.
+latitude,True,True,model_feature,pass,Feature is not a known direct label column.
+longitude,True,True,model_feature,pass,Feature is not a known direct label column.
+rainfall_mm_h,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.
+risk_grade,True,False,direct_label_or_score,pass,"Direct label, risk score, or grade column."
+scenario_expected_visible,True,False,label_source_binary,pass,Binary source used in earlier label construction; excluded from v2 features.
+scenario_flood_label,True,False,target,pass,Target column must not be used as a feature.
+scenario_risk_score,True,False,direct_label_or_score,pass,"Direct label, risk score, or grade column."
+years_since_latest_history,True,True,risk_score_input,review,Public spatial/rainfall feature used to estimate risk; validate with spatial holdout.

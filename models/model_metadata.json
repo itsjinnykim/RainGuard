@@ -16,6 +16,57 @@
   "train_rows": 453,
   "test_rows": 153,
   "test_size": 0.25,
+  "validation_splits": {
+    "random_grid": {
+      "train_rows": 453,
+      "test_rows": 153,
+      "test_size": 0.25
+    },
+    "spatial_east_holdout": {
+      "method": "east_west_longitude_holdout",
+      "test_side": "east",
+      "threshold_longitude": 127.085148,
+      "train_grid_count": 151,
+      "test_grid_count": 51,
+      "train_rows": 453,
+      "test_rows": 153
+    },
+    "spatial_longitude_bands": [
+      {
+        "validation_split": "spatial_band_east",
+        "test_band": "east",
+        "train_grid_count": 151,
+        "test_grid_count": 51,
+        "train_rows": 453,
+        "test_rows": 153
+      },
+      {
+        "validation_split": "spatial_band_mid_east",
+        "test_band": "mid_east",
+        "train_grid_count": 152,
+        "test_grid_count": 50,
+        "train_rows": 456,
+        "test_rows": 150
+      },
+      {
+        "validation_split": "spatial_band_mid_west",
+        "test_band": "mid_west",
+        "train_grid_count": 152,
+        "test_grid_count": 50,
+        "train_rows": 456,
+        "test_rows": 150
+      },
+      {
+        "validation_split": "spatial_band_west",
+        "test_band": "west",
+        "train_grid_count": 151,
+        "test_grid_count": 51,
+        "train_rows": 453,
+        "test_rows": 153
+      }
+    ]
+  },
+  "direct_leakage_found": false,
   "random_state": 42,
   "model_type": "RandomForestClassifier"
 }
