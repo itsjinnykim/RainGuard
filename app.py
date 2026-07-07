@@ -59,6 +59,8 @@ ROAD_GRAPH_PICKLE_PATH = DATA_DIR / "road_network" / "gangnam_walk.pkl"
 
 CLICK_ROUTE_MIN_DISTANCE_KM = 0.08
 CLICK_ROUTE_MAX_NODE_DISTANCE_M = 900
+CLICK_PICKER_MAP_KEY = "rainguard_click_picker"
+ROUTE_RESULT_MAP_KEY = "rainguard_route_result_map"
 
 AI_FEATURE_COLUMNS = [
     "latitude",
@@ -762,6 +764,8 @@ def clear_clicked_route_selection():
     st.session_state.clicked_route_results = None
     st.session_state.clicked_route_context = None
     st.session_state.clicked_route_notice = ""
+    if CLICK_PICKER_MAP_KEY in st.session_state:
+        st.session_state[CLICK_PICKER_MAP_KEY] = {}
 
 
 def build_clicked_route_context(start_coordinate, end_coordinate, mode, rainfall, show_route_comparison):
@@ -776,17 +780,17 @@ def build_clicked_route_context(start_coordinate, end_coordinate, mode, rainfall
 
 def handle_map_click_selection(last_clicked):
     if not last_clicked:
-        return
+        return False
 
     lat = last_clicked.get("lat")
     lon = last_clicked.get("lng", last_clicked.get("lon"))
     if lat is None or lon is None:
-        return
+        return False
 
     coordinate = {"lat": float(lat), "lon": float(lon)}
     signature = format_route_point_signature(coordinate)
     if signature == st.session_state.clicked_last_signature:
-        return
+        return False
 
     if st.session_state.clicked_start is None:
         st.session_state.clicked_start = coordinate
@@ -800,7 +804,13 @@ def handle_map_click_selection(last_clicked):
     st.session_state.clicked_last_signature = signature
     st.session_state.clicked_route_results = None
     st.session_state.clicked_route_context = None
-    st.rerun()
+    return True
+
+
+def sync_click_picker_selection():
+    map_state = st.session_state.get(CLICK_PICKER_MAP_KEY, {})
+    if isinstance(map_state, dict):
+        handle_map_click_selection(map_state.get("last_clicked"))
 
 
 def get_temporary_route_score(rainfall, mode):
@@ -2173,9 +2183,19 @@ base_map_style = st.sidebar.selectbox(
 )
 
 risk = RISK_BY_RAINFALL[rainfall]
-route_should_calculate_now = route_input_method == "주요 지점 선택" or click_route_calculate
-route_needs_ai = route_should_calculate_now and (mode == "안전경로" or show_route_comparison)
-if show_ai_layer or route_needs_ai:
+click_route_has_result = (
+    route_input_method == "지도에서 직접 선택"
+    and clicked_route_context is not None
+    and st.session_state.clicked_route_context == clicked_route_context
+    and st.session_state.clicked_route_results is not None
+)
+route_result_requested = (
+    route_input_method == "주요 지점 선택"
+    or click_route_calculate
+    or click_route_has_result
+)
+route_needs_ai = route_result_requested and (mode == "안전경로" or show_route_comparison)
+if (show_ai_layer and route_result_requested) or route_needs_ai:
     ai_predictions, ai_summary = get_ai_predictions(rainfall)
 else:
     ai_predictions = pd.DataFrame()
@@ -2213,17 +2233,15 @@ elif click_route_calculate and start_point is not None and end_point is not None
     )
     st.session_state.clicked_route_results = route_results
     st.session_state.clicked_route_context = clicked_route_context
-elif (
-    clicked_route_context is not None
-    and st.session_state.clicked_route_context == clicked_route_context
-    and st.session_state.clicked_route_results is not None
-):
+elif click_route_has_result:
     route_results = st.session_state.clicked_route_results
 
 route_result = route_results["selected"] if route_results is not None else None
 
 max_expected_stage = EXPECTED_STAGE_BY_RAINFALL[rainfall]
-spatial_layer_requested = show_expected or show_history_2022 or show_history_2023 or show_history_other
+spatial_layer_requested = route_result_requested and (
+    show_expected or show_history_2022 or show_history_2023 or show_history_other
+)
 if spatial_layer_requested:
     with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
         spatial_layers = load_spatial_layers(
@@ -2262,12 +2280,13 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-render_data_status_card(
-    spatial_layers["summary"],
-    spatial_layers["messages"],
-    expected_stage_label,
-    visible_expected_count,
-)
+if route_result_requested:
+    render_data_status_card(
+        spatial_layers["summary"],
+        spatial_layers["messages"],
+        expected_stage_label,
+        visible_expected_count,
+    )
 
 
 st.markdown(
@@ -2316,15 +2335,68 @@ st.markdown(
 
 analysis_center = [37.5172, 127.0473]
 
+if route_input_method == "지도에서 직접 선택" and route_results is None:
+    picker_map = folium.Map(
+        location=analysis_center,
+        zoom_start=13,
+        tiles=base_map_style,
+        prefer_canvas=True,
+    )
+
+    if base_map_style == "CartoDB positron":
+        picker_tile_tone_css = """
+        <style>
+            .leaflet-tile-pane img {
+                filter: contrast(1.08) saturate(1.05) brightness(0.98);
+            }
+        </style>
+        """
+        picker_map.get_root().header.add_child(folium.Element(picker_tile_tone_css))
+
+    picker_cursor_css = """
+    <style>
+        .leaflet-container,
+        .leaflet-grab,
+        .leaflet-dragging .leaflet-grab {
+            cursor: crosshair !important;
+        }
+    </style>
+    """
+    picker_map.get_root().header.add_child(folium.Element(picker_cursor_css))
+    add_click_route_markers(picker_map, clicked_start_point, clicked_end_point)
+
+    st.markdown(
+        f"""
+<div class="map-card">
+    <div class="section-head">
+        <h3>Route Picker</h3>
+        <span>{rainfall} · click start/end</span>
+    </div>
+    <div class="source-note">
+        출발지와 도착지만 선택하는 경량 지도
+    </div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st_folium(
+        picker_map,
+        width=1240,
+        height=620,
+        key=CLICK_PICKER_MAP_KEY,
+        returned_objects=["last_clicked"],
+        on_change=sync_click_picker_selection,
+    )
+
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.info("지도에서 출발지와 도착지를 선택한 뒤 왼쪽의 경로 계산 버튼을 눌러주세요.")
+    st.stop()
+
 m = folium.Map(
     location=analysis_center,
     zoom_start=13,
     tiles=base_map_style,
     prefer_canvas=True,
-    dragging=route_input_method != "지도에서 직접 선택",
-    scrollWheelZoom=route_input_method != "지도에서 직접 선택",
-    doubleClickZoom=route_input_method != "지도에서 직접 선택",
-    touchZoom=route_input_method != "지도에서 직접 선택",
 )
 
 if base_map_style == "CartoDB positron":
@@ -2336,18 +2408,6 @@ if base_map_style == "CartoDB positron":
     </style>
     """
     m.get_root().header.add_child(folium.Element(tile_tone_css))
-
-if route_input_method == "지도에서 직접 선택":
-    click_select_css = """
-    <style>
-        .leaflet-container,
-        .leaflet-grab,
-        .leaflet-dragging .leaflet-grab {
-            cursor: crosshair !important;
-        }
-    </style>
-    """
-    m.get_root().header.add_child(folium.Element(click_select_css))
 
 for stage in visible_expected_stages:
     style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
@@ -2472,41 +2532,13 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-map_style_key = "cartodb" if base_map_style == "CartoDB positron" else "osm"
-rainfall_key = rainfall.replace("/", "_").replace(" ", "")
-route_input_key = "click" if route_input_method == "지도에서 직접 선택" else "preset"
-mode_key = "safe" if mode == "안전경로" else "shortest"
-if route_input_method == "지도에서 직접 선택":
-    start_key = format_route_point_signature(st.session_state.clicked_start).replace(",", "_").replace(".", "p")
-    end_key = format_route_point_signature(st.session_state.clicked_end).replace(",", "_").replace(".", "p")
-else:
-    start_key = str(route_point_names.index(start_name)) if start_name in route_point_names else "0"
-    end_key = str(route_point_names.index(end_name)) if end_name in route_point_names else "0"
-
-map_key = (
-    f"rainguard_map_v4_{map_style_key}_{rainfall_key}_{int(show_expected)}_"
-    f"{int(show_history_2022)}_{int(show_history_2023)}_{int(show_history_other)}_"
-    f"{int(show_ai_layer)}_{max_expected_stage}_{mode_key}_{route_input_key}_"
-    f"{start_key}_{end_key}_{int(show_route_comparison)}"
-)
-map_returned_objects = (
-    ["last_clicked", "last_object_clicked"]
-    if route_input_method == "지도에서 직접 선택"
-    else []
-)
-map_data = st_folium(
+st_folium(
     m,
     width=1240,
     height=620,
-    key=map_key,
-    returned_objects=map_returned_objects,
+    key=ROUTE_RESULT_MAP_KEY,
+    returned_objects=[],
 )
-
-if route_input_method == "지도에서 직접 선택":
-    clicked_location = None
-    if isinstance(map_data, dict):
-        clicked_location = map_data.get("last_clicked") or map_data.get("last_object_clicked")
-    handle_map_click_selection(clicked_location)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
