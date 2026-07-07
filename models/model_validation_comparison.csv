@@ -1,0 +1,4 @@
+﻿validation_method,accuracy,precision,recall,f1_score,roc_auc,test_sample_count,positive_count,negative_count,note
+random_split,0.9673,0.9107,1.0,0.9533,0.9808,153,51,102,격자 ID 기준 랜덤 분할 검증
+spatial_east_holdout,1.0,1.0,1.0,1.0,1.0,153,32,121,특정 영역에서 모든 지표가 1.0이므로 대표 일반화 성능으로 단독 해석하지 않음
+spatial_4band_mean,0.9587,0.9458,0.9596,0.9515,0.9838,606,220,386,longitude 기준 동서 4개 band를 번갈아 제외한 공간 검증 평균
