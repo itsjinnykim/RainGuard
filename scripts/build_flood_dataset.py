@@ -32,9 +32,24 @@ EXPECTED_STAGE_LABELS = {
 }
 
 RAINFALL_SCENARIOS = {
-    "10mm/h": {"rainfall_mm_h": 10, "max_expected_stage": 2, "risk_multiplier": 0.8},
-    "30mm/h": {"rainfall_mm_h": 30, "max_expected_stage": 4, "risk_multiplier": 1.05},
-    "50mm/h": {"rainfall_mm_h": 50, "max_expected_stage": 6, "risk_multiplier": 1.3},
+    "10mm/h": {
+        "rainfall_mm_h": 10,
+        "max_expected_stage": 2,
+        "risk_multiplier": 0.8,
+        "risk_label_threshold": 62,
+    },
+    "30mm/h": {
+        "rainfall_mm_h": 30,
+        "max_expected_stage": 4,
+        "risk_multiplier": 1.05,
+        "risk_label_threshold": 58,
+    },
+    "50mm/h": {
+        "rainfall_mm_h": 50,
+        "max_expected_stage": 6,
+        "risk_multiplier": 1.3,
+        "risk_label_threshold": 54,
+    },
 }
 KEY_HISTORY_YEARS = (2022, 2023)
 RECENT_HISTORY_WINDOW_YEARS = 5
@@ -401,11 +416,6 @@ def expand_rainfall_scenarios(grid: gpd.GeoDataFrame) -> pd.DataFrame:
             (scenario_df["expected_stage"] > 0)
             & (scenario_df["expected_stage"] <= scenario["max_expected_stage"])
         ).astype(int)
-        scenario_df["scenario_flood_label"] = (
-            (scenario_df["scenario_expected_visible"] == 1)
-            | (scenario_df["flood_history_recent"] == 1)
-        ).astype(int)
-
         proximity = (1 - scenario_df["distance_to_flood_area_m"].fillna(3000) / 1500).clip(0, 1)
         depth_weight = scenario_df["expected_stage"] / 6
         recency_weight = (scenario_df["history_recency_score"] / 3).clip(0, 1)
@@ -420,6 +430,9 @@ def expand_rainfall_scenarios(grid: gpd.GeoDataFrame) -> pd.DataFrame:
         scenario_df["scenario_risk_score"] = (
             raw_score * scenario["risk_multiplier"]
         ).clip(0, 100).round().astype(int)
+        scenario_df["scenario_flood_label"] = (
+            scenario_df["scenario_risk_score"] >= scenario["risk_label_threshold"]
+        ).astype(int)
         scenario_df["risk_grade"] = scenario_df["scenario_risk_score"].map(grade_risk)
         scenario_frames.append(scenario_df)
 
