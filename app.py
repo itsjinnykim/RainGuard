@@ -484,7 +484,11 @@ def ai_risk_grade(probability):
 
 
 def get_ai_predictions(rainfall):
-    signature = build_ai_signature()
+    return get_ai_predictions_for_signature(rainfall, build_ai_signature())
+
+
+@st.cache_data(show_spinner=False)
+def get_ai_predictions_for_signature(rainfall, signature):
     dataset = load_ai_dataset(signature)
     model_payload = load_ai_model(signature)
     metrics = load_ai_metrics(signature)
@@ -1390,6 +1394,37 @@ def add_click_route_markers(map_obj, start_point, end_point):
             popup="클릭 도착지",
             icon=folium.Icon(color="red", icon="stop"),
         ).add_to(map_obj)
+
+def build_click_picker_map(center, base_map_style, start_point, end_point):
+    picker_map = folium.Map(
+        location=center,
+        zoom_start=13,
+        tiles=base_map_style,
+        prefer_canvas=True,
+    )
+
+    if base_map_style == "CartoDB positron":
+        picker_tile_tone_css = """
+        <style>
+            .leaflet-tile-pane img {
+                filter: contrast(1.08) saturate(1.05) brightness(0.98);
+            }
+        </style>
+        """
+        picker_map.get_root().header.add_child(folium.Element(picker_tile_tone_css))
+
+    picker_cursor_css = """
+    <style>
+        .leaflet-container,
+        .leaflet-grab,
+        .leaflet-dragging .leaflet-grab {
+            cursor: crosshair !important;
+        }
+    </style>
+    """
+    picker_map.get_root().header.add_child(folium.Element(picker_cursor_css))
+    add_click_route_markers(picker_map, start_point, end_point)
+    return picker_map
 
 
 def draw_route_line(map_obj, route_result, color, weight, opacity, tooltip, dash_array=None):
@@ -2336,34 +2371,12 @@ st.markdown(
 analysis_center = [37.5172, 127.0473]
 
 if route_input_method == "지도에서 직접 선택" and route_results is None:
-    picker_map = folium.Map(
-        location=analysis_center,
-        zoom_start=13,
-        tiles=base_map_style,
-        prefer_canvas=True,
+    picker_map = build_click_picker_map(
+        analysis_center,
+        base_map_style,
+        clicked_start_point,
+        clicked_end_point,
     )
-
-    if base_map_style == "CartoDB positron":
-        picker_tile_tone_css = """
-        <style>
-            .leaflet-tile-pane img {
-                filter: contrast(1.08) saturate(1.05) brightness(0.98);
-            }
-        </style>
-        """
-        picker_map.get_root().header.add_child(folium.Element(picker_tile_tone_css))
-
-    picker_cursor_css = """
-    <style>
-        .leaflet-container,
-        .leaflet-grab,
-        .leaflet-dragging .leaflet-grab {
-            cursor: crosshair !important;
-        }
-    </style>
-    """
-    picker_map.get_root().header.add_child(folium.Element(picker_cursor_css))
-    add_click_route_markers(picker_map, clicked_start_point, clicked_end_point)
 
     st.markdown(
         f"""
