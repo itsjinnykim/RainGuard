@@ -277,55 +277,57 @@ def simplify_for_map(gdf):
     return mapped
 
 
-def build_data_signature(load_expected, load_history_2022, load_history_2023, load_history_other):
+def get_history_year(shp_path):
+    """Return the first plausible four-digit year found in a history file path."""
+    for part in reversed(shp_path.parts):
+        match = re.search(r"(?<!\d)(19\d{2}|20\d{2})(?!\d)", part)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def discover_history_years():
+    return sorted(
+        {
+            year
+            for path in find_shp_files(FLOOD_HISTORY_DIR)
+            if (year := get_history_year(path)) is not None
+        },
+        reverse=True,
+    )
+
+
+def build_data_signature(load_expected, selected_history_years):
     shp_files = []
     if load_expected:
         shp_files.extend(find_shp_files(FLOOD_EXPECTED_DIR))
 
-    if load_history_2022 or load_history_2023 or load_history_other:
+    selected_years = set(selected_history_years)
+    if selected_years:
         history_files = find_shp_files(FLOOD_HISTORY_DIR)
-        if load_history_2022:
-            shp_files.extend(path for path in history_files if "2022" in path.name)
-        if load_history_2023:
-            shp_files.extend(path for path in history_files if "2023" in path.name)
-        if load_history_other:
-            shp_files.extend(
-                path for path in history_files if "2022" not in path.name and "2023" not in path.name
-            )
+        shp_files.extend(path for path in history_files if get_history_year(path) in selected_years)
 
     return tuple((str(path), path.stat().st_mtime, path.stat().st_size) for path in shp_files)
 
 
 @st.cache_data(show_spinner=False)
-def load_spatial_layers(signature, load_expected, load_history_2022, load_history_2023, load_history_other):
+def load_spatial_layers(signature, load_expected, selected_history_years):
+    selected_history_years = tuple(selected_history_years)
     if gpd is None:
         return {
             "expected_by_stage": {},
-            "history_2022": None,
-            "history_2023": None,
-            "history_other": None,
-            "summary": [
-                {"name": "침수예상도", "files": 0, "features": 0},
-                {"name": "2022 침수흔적도", "files": 0, "features": 0},
-                {"name": "2023 침수흔적도", "files": 0, "features": 0},
-                {"name": "과거 침수흔적도", "files": 0, "features": 0},
-            ],
+            "expected_stage_counts": {},
+            "history_by_year": {},
+            "summary": [{"name": "침수예상도", "files": 0, "features": 0}],
             "messages": ["GeoPandas가 설치되어 있지 않아 SHP 파일을 읽을 수 없음"],
         }
 
     expected_files = find_shp_files(FLOOD_EXPECTED_DIR) if load_expected else []
-    history_files = (
-        find_shp_files(FLOOD_HISTORY_DIR)
-        if load_history_2022 or load_history_2023 or load_history_other
-        else []
-    )
-    history_2022_files = [path for path in history_files if "2022" in path.name] if load_history_2022 else []
-    history_2023_files = [path for path in history_files if "2023" in path.name] if load_history_2023 else []
-    history_other_files = (
-        [path for path in history_files if "2022" not in path.name and "2023" not in path.name]
-        if load_history_other
-        else []
-    )
+    history_files = find_shp_files(FLOOD_HISTORY_DIR) if selected_history_years else []
+    history_files_by_year = {
+        year: [path for path in history_files if get_history_year(path) == year]
+        for year in selected_history_years
+    }
 
     expected_by_stage = {}
     expected_stage_counts = {}
@@ -344,34 +346,33 @@ def load_spatial_layers(signature, load_expected, load_history_2022, load_histor
         expected_by_stage[stage] = simplify_for_map(gdf)
 
     expected_count = sum(expected_stage_counts.values())
-    history_2022, history_2022_count, history_2022_messages = combine_shp_files(history_2022_files)
-    history_2023, history_2023_count, history_2023_messages = combine_shp_files(history_2023_files)
-    history_other, history_other_count, history_other_messages = combine_shp_files(history_other_files)
+    history_by_year = {}
+    history_counts = {}
+    history_messages = []
+    for year, year_files in history_files_by_year.items():
+        history_gdf, feature_count, year_messages = combine_shp_files(year_files)
+        history_by_year[year] = simplify_for_map(history_gdf)
+        history_counts[year] = feature_count
+        history_messages.extend(year_messages)
 
     messages = []
     if load_expected and not expected_files:
         messages.append("data/flood_expected 폴더에서 .shp 파일을 찾지 못함")
-    if load_history_2022 and not history_2022_files:
-        messages.append("data/flood_history 폴더에서 2022 .shp 파일을 찾지 못함")
-    if load_history_2023 and not history_2023_files:
-        messages.append("data/flood_history 폴더에서 2023 .shp 파일을 찾지 못함")
+    for year, year_files in history_files_by_year.items():
+        if not year_files:
+            messages.append(f"data/flood_history 폴더에서 {year} .shp 파일을 찾지 못함")
 
     messages.extend(expected_messages)
-    messages.extend(history_2022_messages)
-    messages.extend(history_2023_messages)
-    messages.extend(history_other_messages)
+    messages.extend(history_messages)
 
     return {
         "expected_by_stage": expected_by_stage,
         "expected_stage_counts": expected_stage_counts,
-        "history_2022": simplify_for_map(history_2022),
-        "history_2023": simplify_for_map(history_2023),
-        "history_other": simplify_for_map(history_other),
-        "summary": [
-            {"name": "침수예상도", "files": len(expected_files), "features": expected_count},
-            {"name": "2022 침수흔적도", "files": len(history_2022_files), "features": history_2022_count},
-            {"name": "2023 침수흔적도", "files": len(history_2023_files), "features": history_2023_count},
-            {"name": "과거 침수흔적도", "files": len(history_other_files), "features": history_other_count},
+        "history_by_year": history_by_year,
+        "summary": [{"name": "침수예상도", "files": len(expected_files), "features": expected_count}]
+        + [
+            {"name": f"{year} 침수흔적도", "files": len(history_files_by_year[year]), "features": history_counts[year]}
+            for year in selected_history_years
         ],
         "messages": messages,
     }
@@ -381,15 +382,8 @@ def empty_spatial_layers(message="선택된 SHP 레이어 없음"):
     return {
         "expected_by_stage": {},
         "expected_stage_counts": {},
-        "history_2022": None,
-        "history_2023": None,
-        "history_other": None,
-        "summary": [
-            {"name": "침수예상도", "files": 0, "features": 0},
-            {"name": "2022 침수흔적도", "files": 0, "features": 0},
-            {"name": "2023 침수흔적도", "files": 0, "features": 0},
-            {"name": "과거 침수흔적도", "files": 0, "features": 0},
-        ],
+        "history_by_year": {},
+        "summary": [{"name": "침수예상도", "files": 0, "features": 0}],
         "messages": [message] if message else [],
     }
 
@@ -2208,9 +2202,18 @@ st.sidebar.markdown(
 )
 
 show_expected = st.sidebar.checkbox("침수예상도 표시", value=True)
-show_history_2022 = st.sidebar.checkbox("2022 침수흔적도 표시", value=False)
-show_history_2023 = st.sidebar.checkbox("2023 침수흔적도 표시", value=False)
-show_history_other = st.sidebar.checkbox("과거 침수흔적도 표시", value=False)
+available_history_years = discover_history_years()
+default_history_years = [year for year in (2022, 2023) if year in available_history_years]
+selected_history_years = tuple(
+    st.sidebar.multiselect(
+        "침수흔적도 연도",
+        options=available_history_years,
+        default=default_history_years,
+        placeholder="보유 데이터 없음" if not available_history_years else "표시할 연도 선택",
+    )
+)
+if not available_history_years:
+    st.sidebar.caption("data/flood_history에 연도가 포함된 SHP 파일을 추가하세요.")
 show_ai_layer = st.sidebar.checkbox("AI 예측", value=True)
 base_map_style = st.sidebar.selectbox(
     "지도 스타일",
@@ -2230,7 +2233,7 @@ route_result_requested = (
     or click_route_has_result
 )
 route_needs_ai = route_result_requested and (mode == "안전경로" or show_route_comparison)
-if (show_ai_layer and route_result_requested) or route_needs_ai:
+if show_ai_layer or route_needs_ai:
     ai_predictions, ai_summary = get_ai_predictions(rainfall)
 else:
     ai_predictions = pd.DataFrame()
@@ -2274,17 +2277,13 @@ elif click_route_has_result:
 route_result = route_results["selected"] if route_results is not None else None
 
 max_expected_stage = EXPECTED_STAGE_BY_RAINFALL[rainfall]
-spatial_layer_requested = route_result_requested and (
-    show_expected or show_history_2022 or show_history_2023 or show_history_other
-)
+spatial_layer_requested = show_expected or bool(selected_history_years)
 if spatial_layer_requested:
     with st.spinner("SHP 공간 데이터를 불러오는 중입니다..."):
         spatial_layers = load_spatial_layers(
-            build_data_signature(show_expected, show_history_2022, show_history_2023, show_history_other),
+            build_data_signature(show_expected, selected_history_years),
             show_expected,
-            show_history_2022,
-            show_history_2023,
-            show_history_other,
+            selected_history_years,
         )
 else:
     spatial_layers = empty_spatial_layers()
@@ -2315,7 +2314,7 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
-if route_result_requested:
+if spatial_layer_requested:
     render_data_status_card(
         spatial_layers["summary"],
         spatial_layers["messages"],
@@ -2377,6 +2376,38 @@ if route_input_method == "지도에서 직접 선택" and route_results is None:
         clicked_start_point,
         clicked_end_point,
     )
+    for stage in visible_expected_stages:
+        style = EXPECTED_STAGE_STYLE.get(stage, EXPECTED_STAGE_STYLE[6])
+        add_polygon_layer(
+            picker_map,
+            spatial_layers["expected_by_stage"].get(stage),
+            f"침수예상도 {style['label']}",
+            style["color"],
+            style["fill"],
+            style["opacity"],
+            0.9,
+            True,
+        )
+    picker_history_palette = [
+        ("#ef4444", "#fb7185"), ("#d97706", "#facc15"),
+        ("#2563eb", "#60a5fa"), ("#059669", "#34d399"),
+        ("#7c3aed", "#a78bfa"), ("#475569", "#94a3b8"),
+    ]
+    for index, year in enumerate(selected_history_years):
+        color, fill_color = picker_history_palette[index % len(picker_history_palette)]
+        add_polygon_layer(
+            picker_map,
+            spatial_layers["history_by_year"].get(year),
+            f"{year} 침수흔적도",
+            color,
+            fill_color,
+            0.18,
+            1.5,
+            True,
+            "4" if index % 2 else None,
+        )
+    add_ai_prediction_layer(picker_map, ai_predictions, show_ai_layer)
+    folium.LayerControl(collapsed=True).add_to(picker_map)
 
     st.markdown(
         f"""
@@ -2435,40 +2466,29 @@ for stage in visible_expected_stages:
         show=show_expected,
     )
 
-add_polygon_layer(
-    m,
-    spatial_layers["history_2022"],
-    "2022 침수흔적도",
-    color="#d97706",
-    fill_color="#facc15",
-    fill_opacity=0.18,
-    weight=1.6,
-    show=show_history_2022,
-)
-
-add_polygon_layer(
-    m,
-    spatial_layers["history_2023"],
-    "2023 침수흔적도",
-    color="#ef4444",
-    fill_color="#fb7185",
-    fill_opacity=0.2,
-    weight=1.8,
-    show=show_history_2023,
-    dash_array="4",
-)
-
-add_polygon_layer(
-    m,
-    spatial_layers["history_other"],
-    "과거 침수흔적도",
-    color="#475569",
-    fill_color="#94a3b8",
-    fill_opacity=0.12,
-    weight=1.1,
-    show=show_history_other,
-    dash_array="2",
-)
+history_palette = [
+    ("#ef4444", "#fb7185"),
+    ("#d97706", "#facc15"),
+    ("#2563eb", "#60a5fa"),
+    ("#059669", "#34d399"),
+    ("#7c3aed", "#a78bfa"),
+    ("#475569", "#94a3b8"),
+]
+history_styles = {}
+for index, year in enumerate(selected_history_years):
+    color, fill_color = history_palette[index % len(history_palette)]
+    history_styles[year] = (color, fill_color)
+    add_polygon_layer(
+        m,
+        spatial_layers["history_by_year"].get(year),
+        f"{year} 침수흔적도",
+        color=color,
+        fill_color=fill_color,
+        fill_opacity=0.18,
+        weight=1.5,
+        show=True,
+        dash_array="4" if index % 2 else None,
+    )
 
 add_ai_prediction_layer(m, ai_predictions, show_ai_layer)
 if route_results is not None:
@@ -2524,9 +2544,10 @@ legend_html = f"""
     <div><span style="display:inline-block;width:18px;height:10px;background:#8fd3ff;border:1px solid #398fca;margin-right:6px;"></span>68%+</div>
     <div><span style="display:inline-block;width:18px;height:10px;background:#c084fc;border:1px solid #7e22ce;margin-right:6px;"></span>85%+</div>
     <div style="height:1px;background:#e2e8f0;margin:9px 0 7px;"></div>
-    <div><span style="display:inline-block;width:18px;height:10px;background:#facc15;border:1px solid #d97706;margin-right:6px;"></span>2022 침수흔적도</div>
-    <div><span style="display:inline-block;width:18px;height:10px;background:#fb7185;border:1px solid #ef4444;margin-right:6px;"></span>2023 침수흔적도</div>
-    <div><span style="display:inline-block;width:18px;height:10px;background:#94a3b8;border:1px solid #475569;margin-right:6px;"></span>과거 침수흔적도</div>
+    {''.join(
+        f'<div><span style="display:inline-block;width:18px;height:10px;background:{history_styles[year][1]};border:1px solid {history_styles[year][0]};margin-right:6px;"></span>{year} 침수흔적도</div>'
+        for year in selected_history_years
+    )}
 </div>
 """
 m.get_root().html.add_child(folium.Element(legend_html))
