@@ -179,3 +179,5 @@ python scripts/build_road_network.py
 - 강수량은 실시간 예보 API가 아니라 10mm/h, 30mm/h, 50mm/h 시나리오입니다.
 - 모델 검증 결과는 현재 보유한 강남구 프로토타입 데이터셋 기준입니다.
 - 향후 기상청 단기예보조회서비스 API 연동, 더 긴 기간의 침수흔적도 추가, 배수시설/지형/도로 고도 데이터 반영, 다른 자치구 확장을 진행할 예정입니다.
+
+https://itsjinnykim-rainguard-app-sdxonp.streamlit.app/
